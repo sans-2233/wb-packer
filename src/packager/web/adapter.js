@@ -4,11 +4,26 @@ import {readAsURL, readAsArrayBuffer} from '../../common/readers';
 import defaultIcon from '../images/default-icon.png';
 
 class WebAdapter {
-  getCachedAsset (asset) {
-    return assetCache.get(asset)
+  async getCachedAsset (asset) {
+    try {
+      const sha256 = asset && asset.sha256;
+      const api = (typeof window !== 'undefined') ? window.PackagerLargeAssetsCachePreload : null;
+      if (sha256 && api && typeof api.get === 'function') {
+        const cached = await api.get(String(sha256).toLowerCase());
+        if (cached) return cached;
+      }
+    } catch (e) {}
+    return assetCache.get(asset);
   }
 
   async cacheAsset (asset, result) {
+    try {
+      const sha256 = asset && asset.sha256;
+      const api = (typeof window !== 'undefined') ? window.PackagerLargeAssetsCachePreload : null;
+      if (sha256 && api && typeof api.set === 'function') {
+        await api.set(String(sha256).toLowerCase(), result);
+      }
+    } catch (e) {}
     await assetCache.set(asset, result);
   }
 

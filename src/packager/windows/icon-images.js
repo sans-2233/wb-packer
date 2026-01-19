@@ -1,4 +1,5 @@
 import {readAsArrayBuffer} from '../../common/readers';
+import {Data} from '@shockpkg/resedit';
 
 const toUint8Array = (data) => {
   if (data instanceof Uint8Array) return data;
@@ -62,6 +63,16 @@ export const createWindowsIconPngList = async (basePngData, sizes = [256, 128, 6
     const blob = await renderPngAtSize(image, size);
     const bytes = await readAsArrayBuffer(blob);
     results.push(new Uint8Array(bytes));
+  }
+  return results;
+};
+
+export const createWindowsIconRawItemList = async (basePngData, sizes = [256, 128, 64, 48, 32, 16]) => {
+  const pngs = await createWindowsIconPngList(basePngData, sizes);
+  const results = [];
+  for (let i = 0; i < pngs.length; i++) {
+    const size = sizes[i] | 0;
+    results.push(Data.RawIconItem.from(pngs[i], size || 256, size || 256, 32));
   }
   return results;
 };

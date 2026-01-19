@@ -1,5 +1,5 @@
 import {NtExecutable, NtExecutableResource, Resource} from '@shockpkg/resedit';
-import {createWindowsIconPngList} from './icon-images';
+import {createWindowsIconRawItemList} from './icon-images';
 
 const toUint8Array = (data) => {
   if (data instanceof Uint8Array) return data;
@@ -21,7 +21,7 @@ export const patchWindowsExecutableIcon = async (exeData, baseIconPngData) => {
   }
   const group = iconGroups[0];
 
-  const iconPngs = await createWindowsIconPngList(baseIconPngData);
+  const iconPngs = await createWindowsIconRawItemList(baseIconPngData);
   Resource.IconGroupEntry.replaceIconsForResource(
     res.entries,
     group.id,

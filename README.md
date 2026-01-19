@@ -4,6 +4,10 @@
 
 Converts Scratch projects into HTML files, zip archives, or executable programs for Windows, macOS, and Linux.
 
+## 更新记录
+
+见 [CHANGELOG.md](file:///g:/工程/javascript/desktop/wb-packager/CHANGELOG.md)
+
 ## 本仓库的定位与边界
 
 - 这是一个“修改版”仓库：在上游 packager 的基础上增加了插件系统与打包保护相关的选项整合

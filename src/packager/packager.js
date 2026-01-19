@@ -16,6 +16,7 @@ import {Adapter} from './adapter';
 import encodeBigString from './encode-big-string';
 import {loadPluginsFromDir, loadPluginsFromDesktopPreload, runHookChain} from './plugin-system';
 import {patchWindowsExecutableIcon} from './windows/patch-exe-icon';
+import {pngToIco} from './windows/png-to-ico';
 
 const PROGRESS_LOADED_SCRIPTS = 0.1;
 
@@ -252,11 +253,12 @@ const buildXorResourcePackMeta = (projectId, keyBytes, saltBytes, partCount = 8)
   };
 };
 
-const injectWbResMetaIntoHtml = (htmlBytes, meta) => {
+const injectWbResMetaIntoHtml = (htmlBytes, meta, nonce) => {
   try {
     const text = new TextDecoder().decode(htmlBytes);
     if (text.includes('window.__WB_RSP__')) return htmlBytes;
-    const injected = text.replace('</body>', `<script>window.__WB_RSP__=${JSON.stringify(meta)};</script></body>`);
+    const nonceAttr = (typeof nonce === 'string' && nonce) ? ` nonce="${nonce}"` : '';
+    const injected = text.replace('</body>', `<script${nonceAttr}>window.__WB_RSP__=${JSON.stringify(meta)};</script></body>`);
     if (injected === text) return htmlBytes;
     return new TextEncoder().encode(injected);
   } catch (e) {
@@ -909,16 +911,101 @@ cd "$(dirname "$0")"
 
     const icon = await Adapter.getAppIcon(this.options.app.icon);
     zip.file(`${resourcesPrefix}${iconName}`, icon);
+    const packagerInfo = {
+      buildId: buildId || null,
+      target: this.options.target,
+      packageName,
+      version: this.options.app && this.options.app.version,
+      logLines: [],
+      wb: {
+        protectElectron: !!(this.options.wb && this.options.wb.protectElectron),
+        encryptProject: !!(this.options.wb && this.options.wb.encryptProject),
+        encryptRuntime: !!(this.options.wb && this.options.wb.encryptRuntime),
+        opcodeObfuscation: !!(this.options.wb && this.options.wb.opcodeObfuscation),
+        shredWbResources: !!(this.options.wb && this.options.wb.shredWbResources),
+        splitElectronEntry: !!(this.options.wb && this.options.wb.splitElectronEntry),
+        secureCsp: !!(this.options.wb && this.options.wb.secureCsp),
+        extensionLoadStrategy: (this.options.wb && this.options.wb.extensionLoadStrategy) || 'auto',
+        debugLog: !!(this.options.wb && this.options.wb.debugLog),
+        debugLogVerbose: !!(this.options.wb && this.options.wb.debugLogVerbose)
+      },
+      embeddedExtensions: {
+        files: this._embeddedExtensionFiles ? Object.keys(this._embeddedExtensionFiles).length : 0
+      },
+      windows: {
+        writeWindowsExeIcon: !!(this.options.app && this.options.app.writeWindowsExeIcon !== false),
+        exportWindowsIco: !!(this.options.app && this.options.app.exportWindowsIco),
+        exeIconPatched: null,
+        exeIconError: null,
+        exportedIco: null,
+        exportedIcoError: null
+      },
+      macos: {
+        writeMacElectronIcns: !!(this.options.app && this.options.app.writeMacElectronIcns !== false),
+        icnsWritten: null,
+        icnsError: null
+      },
+      linux: {
+        exportDesktopFile: !!(this.options.app && this.options.app.exportLinuxDesktopFile),
+        desktopWritten: null,
+        desktopError: null
+      }
+    };
+    const wbPackagerLog = (message, data) => {
+      const m = String(message || '');
+      const payload = (typeof data === 'undefined') ? '' : (() => {
+        try { return JSON.stringify(data); } catch (e) { return String(data); }
+      })();
+      const line = payload ? `${m} ${payload}` : m;
+      try { packagerInfo.logLines.push(line); } catch (e) {}
+      try { console.log('[packager]', line); } catch (e) {}
+    };
+    wbPackagerLog('build', {buildId: packagerInfo.buildId, target: packagerInfo.target, packageName: packagerInfo.packageName, version: packagerInfo.version});
+    wbPackagerLog('wb options', packagerInfo.wb);
+    wbPackagerLog('embedded extensions', packagerInfo.embeddedExtensions);
+    if (isWindows && this.options.app.exportWindowsIco) {
+      try {
+        const ico = await pngToIco(icon);
+        zip.file(`${resourcesPrefix}icon.ico`, ico);
+        packagerInfo.windows.exportedIco = true;
+        wbPackagerLog('windows icon.ico exported');
+      } catch (e) {
+        console.warn(e);
+        packagerInfo.windows.exportedIco = false;
+        packagerInfo.windows.exportedIcoError = String(e && (e.stack || e));
+        wbPackagerLog('windows icon.ico export failed', {error: packagerInfo.windows.exportedIcoError});
+      }
+    }
     if (isWindows && this.options.app.writeWindowsExeIcon !== false) {
       try {
         const exePath = `${rootPrefix}${packageName}.exe`;
         const exe = await zip.file(exePath).async('arraybuffer');
         const patchedExe = await patchWindowsExecutableIcon(exe, icon);
         zip.file(exePath, patchedExe);
+        packagerInfo.windows.exeIconPatched = true;
+        wbPackagerLog('windows exe icon patched', {exePath});
       } catch (e) {
         console.warn(e);
+        packagerInfo.windows.exeIconPatched = false;
+        packagerInfo.windows.exeIconError = String(e && (e.stack || e));
+        wbPackagerLog('windows exe icon patch failed', {error: packagerInfo.windows.exeIconError});
       }
     }
+    const writePackagerInfo = () => {
+      try {
+        zip.file(`${resourcesPrefix}wb-packager-info.json`, JSON.stringify(packagerInfo, null, 2));
+        try {
+          const text = packagerInfo.logLines.join('\n') + '\n';
+          zip.file(`${resourcesPrefix}wb-packager.log`, text);
+        } catch (e) {}
+        try {
+          this.dispatchEvent(new CustomEvent('wb-packager-info', {detail: packagerInfo}));
+        } catch (e) {}
+        wbPackagerLog('wb-packager-info.json written');
+      } catch (e) {
+        console.warn('[packager]', 'failed to write wb-packager-info.json');
+      }
+    };
 
     const manifest = {
       name: packageName,
@@ -1550,7 +1637,37 @@ ipcMain.handle('overlay-destroy', async (event, {id}) => {
 ipcMain.handle('wb-read-file', async (event, {path: relativePath}) => {
   const rel = typeof relativePath === 'string' ? relativePath : '';
   const safe = rel.replace(/^\.?[\\/]+/, '');
-  const resolved = path.join(__dirname, safe);
+  const candidates = [];
+  try {
+    if (typeof process === 'object' && process) {
+      if (typeof process.resourcesPath === 'string' && process.resourcesPath) {
+        candidates.push(path.join(process.resourcesPath, 'app'));
+        candidates.push(path.join(process.resourcesPath, 'app.asar'));
+        candidates.push(path.join(process.resourcesPath, 'app.asar.unpacked'));
+      }
+      if (typeof process.execPath === 'string' && process.execPath) {
+        candidates.push(path.dirname(process.execPath));
+      }
+      if (typeof process.cwd === 'function') {
+        candidates.push(process.cwd());
+      }
+    }
+  } catch (e) {}
+  candidates.push(__dirname);
+  let resolved = null;
+  for (const base of candidates) {
+    try {
+      if (!base) continue;
+      const attempt = path.join(base, safe);
+      if (fs.existsSync(attempt)) {
+        resolved = attempt;
+        break;
+      }
+    } catch (e) {}
+  }
+  if (!resolved) {
+    resolved = path.join(__dirname, safe);
+  }
   const data = fs.readFileSync(resolved);
   return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
 });
@@ -1749,8 +1866,21 @@ ipcMain.handle('wb-open-devtools', async (event) => {
         });
       }
 
-      const icns = await pngToAppleICNS(icon);
-      zip.file(`${contentsPrefix}Resources/electron.icns`, icns);
+      if (this.options.app.writeMacElectronIcns !== false) {
+        try {
+          const icns = await pngToAppleICNS(icon);
+          zip.file(`${contentsPrefix}Resources/electron.icns`, icns);
+          packagerInfo.macos.icnsWritten = true;
+          wbPackagerLog('macos electron.icns written');
+        } catch (e) {
+          packagerInfo.macos.icnsWritten = false;
+          packagerInfo.macos.icnsError = String(e && (e.stack || e));
+          wbPackagerLog('macos electron.icns write failed', {error: packagerInfo.macos.icnsError});
+        }
+      } else {
+        packagerInfo.macos.icnsWritten = null;
+        wbPackagerLog('macos electron.icns skipped');
+      }
     } else if (isLinux) {
       // Some Linux distributions can't easily open the executable file from the GUI, so we'll add a simple wrapper that people can use instead.
       const startScript = `#!/bin/bash
@@ -1759,8 +1889,48 @@ cd "$(dirname "$0")"
       zip.file(`${rootPrefix}start.sh`, startScript, {
         unixPermissions: 0o100755
       });
+      if (this.options.app.exportLinuxDesktopFile) {
+        try {
+          const desktopName = `${packageName}.desktop`;
+          const iconInstallPath = `${packageName}/icons/hicolor/512x512/apps/${packageName}.png`;
+          zip.file(iconInstallPath, icon);
+          const desktop = [
+            '[Desktop Entry]',
+            'Type=Application',
+            `Name=${this.options.app.windowTitle || packageName}`,
+            `Exec=sh -c 'cd \"$(dirname \"%k\")\"; ./start.sh'`,
+            `Icon=${packageName}`,
+            'Terminal=false',
+            'Categories=Game;'
+          ].join('\n') + '\n';
+          zip.file(`${packageName}/${desktopName}`, desktop);
+          const installScript = `#!/bin/bash
+set -e
+DIR="$(cd "$(dirname "$0")" && pwd)"
+APP="${packageName}"
+mkdir -p "$HOME/.local/share/applications"
+mkdir -p "$HOME/.local/share/icons/hicolor/512x512/apps"
+cp "$DIR/${desktopName}" "$HOME/.local/share/applications/${packageName}.desktop"
+cp "$DIR/icons/hicolor/512x512/apps/${packageName}.png" "$HOME/.local/share/icons/hicolor/512x512/apps/${packageName}.png"
+update-desktop-database "$HOME/.local/share/applications" >/dev/null 2>&1 || true
+gtk-update-icon-cache -q "$HOME/.local/share/icons/hicolor" >/dev/null 2>&1 || true
+echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.desktop"
+`;
+          zip.file(`${packageName}/install-desktop.sh`, installScript, {unixPermissions: 0o100755});
+          packagerInfo.linux.desktopWritten = true;
+          wbPackagerLog('linux desktop entry written', {desktop: `${packageName}/${desktopName}`, icon: iconInstallPath});
+        } catch (e) {
+          packagerInfo.linux.desktopWritten = false;
+          packagerInfo.linux.desktopError = String(e && (e.stack || e));
+          wbPackagerLog('linux desktop entry write failed', {error: packagerInfo.linux.desktopError});
+        }
+      } else {
+        packagerInfo.linux.desktopWritten = null;
+        wbPackagerLog('linux desktop entry skipped');
+      }
     }
 
+    writePackagerInfo();
     return zip;
   }
 
@@ -1874,6 +2044,7 @@ cd "$(dirname "$0")"
     const packResourcesXor = !!(this.options.wb && this.options.wb.packResourcesXor);
     const shredWbResources = !!(encryptProject && this.options.wb && this.options.wb.shredWbResources);
     const obfuscateUnpack = !!(this.options.wb && this.options.wb.obfuscateUnpack);
+    const nonceAttr = (this.options.wb && this.options.wb.secureCsp && this._wbCspNonce) ? ` nonce="${this._wbCspNonce}"` : '';
     let wbUnpackHelpers = '';
     if (encryptProject) {
       const enc = this.wbEncryption;
@@ -1881,7 +2052,7 @@ cd "$(dirname "$0")"
         throw new Error('Missing encryption metadata');
       }
       result.push(`
-      <script>
+      <script${nonceAttr}>
         window.__WB_ENC__ = ${JSON.stringify(Object.assign({}, enc, shredWbResources ? {shred: {parts: 32}} : null))};
       </script>`);
 
@@ -1991,12 +2162,12 @@ cd "$(dirname "$0")"
         const seed = (fileSeed('project') ^ saltBytes[0]) & 0xff;
         meta.seed = seed;
         projectData = xorCrypt(originalProjectData, keyBytes, seed);
-        result.push(`<script>window.__WB_PX__=${JSON.stringify(meta)};</script>`);
+        result.push(`<script${nonceAttr}>window.__WB_PX__=${JSON.stringify(meta)};</script>`);
       }
 
       // keep this up-to-date with base85.js
       result.push(`
-      <script>
+      <script${nonceAttr}>
       const getBase85DecodeValue = (code) => {
         if (code === 0x28) code = 0x3c;
         if (code === 0x29) code = 0x3e;
@@ -2261,7 +2432,7 @@ cd "$(dirname "$0")"
     }
 
     result.push(`
-    <script>
+    <script${nonceAttr}>
       const getProjectData = (function() {
         const storage = scaffolding.storage;
         storage.onprogress = (total, loaded) => {
@@ -2511,6 +2682,23 @@ cd "$(dirname "$0")"
       }
     }));
 
+    const isSecureCsp = (() => {
+      const wb = this.options && this.options.wb;
+      return !!(wb && wb.secureCsp);
+    })();
+    const extensionLoadStrategy = (() => {
+      const wb = this.options && this.options.wb;
+      const configured = wb && typeof wb.extensionLoadStrategy === 'string' ? wb.extensionLoadStrategy : 'auto';
+      if (configured === 'file' || configured === 'data') return configured;
+      if (this.options && this.options.target === 'html') return 'data';
+      return isSecureCsp ? 'file' : 'data';
+    })();
+    if (extensionLoadStrategy === 'file') {
+      if (!this._embeddedExtensionFiles || typeof this._embeddedExtensionFiles !== 'object') {
+        this._embeddedExtensionFiles = {};
+      }
+    }
+
     const shouldTryToFetch = (url) => {
       if (!this.options.bakeExtensions) {
         return false;
@@ -2529,6 +2717,37 @@ cd "$(dirname "$0")"
     const urlsToFetch = allURLs.filter((url) => shouldTryToFetch(url));
     const finalURLs = [...unfetchableURLs];
 
+    const extractDataUriCode = (dataUri) => {
+      const s = String(dataUri || '');
+      const comma = s.indexOf(',');
+      if (comma === -1) return '';
+      const encoded = s.slice(comma + 1);
+      try {
+        return decodeURIComponent(encoded);
+      } catch (e) {
+        return encoded;
+      }
+    };
+    const storeExtensionAsFile = (code) => {
+      const js = String(code || '');
+      const hash = sha256HexOfString(js);
+      const filePath = `extensions/${hash}.js`;
+      this._embeddedExtensionFiles[filePath] = js;
+      return `./${filePath}`;
+    };
+    const maybeConvertDataUri = (url) => {
+      if (extensionLoadStrategy !== 'file') return url;
+      const s = String(url || '');
+      if (!s.startsWith('data:text/javascript')) return url;
+      const js = extractDataUriCode(s);
+      if (!js) return url;
+      return storeExtensionAsFile(js);
+    };
+
+    for (let i = 0; i < finalURLs.length; i++) {
+      finalURLs[i] = maybeConvertDataUri(finalURLs[i]);
+    }
+
     if (urlsToFetch.length !== 0) {
       for (let i = 0; i < urlsToFetch.length; i++) {
         dispatchProgress(i / urlsToFetch.length);
@@ -2539,8 +2758,12 @@ cd "$(dirname "$0")"
           // likely to cause issues in an unsandboxed environment due to global pollution or
           // overriding Scratch.*
           const wrappedSource = `(function(Scratch) { ${source} })(Scratch);`
-          const dataURI = `data:text/javascript;,${encodeURIComponent(wrappedSource)}`;
-          finalURLs.push(dataURI);
+          if (extensionLoadStrategy === 'file') {
+            finalURLs.push(storeExtensionAsFile(wrappedSource));
+          } else {
+            const dataURI = `data:text/javascript;,${encodeURIComponent(wrappedSource)}`;
+            finalURLs.push(dataURI);
+          }
         } catch (e) {
           console.warn('Could not bake extension', url, e);
           finalURLs.push(url);
@@ -2565,6 +2788,7 @@ cd "$(dirname "$0")"
     this.ensureNotAborted();
     await this.loadPlugins();
     await this.runPluginHook('beforePackage', null, {phase: 'beforePackage'});
+    this._embeddedExtensionFiles = null;
     const packResourcesXor = !!(this.options.wb && this.options.wb.packResourcesXor);
     const encryptProject = !!(this.options.wb && this.options.wb.encryptProject && this.options.target !== 'html');
     if (encryptProject) {
@@ -2707,9 +2931,13 @@ cd "$(dirname "$0")"
       }
     }
     const useCleanTemplate = !!(this.options.wb && this.options.wb.cleanHtmlTemplate);
-    const useSecureCsp = !!(this.options.wb && (this.options.wb.secureCsp || ((this.options.wb.encryptProject || this.options.wb.protectElectron) && String(this.options.target || '').startsWith('electron-'))));
+    const useSecureCsp = !!(this.options.wb && this.options.wb.secureCsp);
+    const isLocalTarget = String(this.options.target || '').startsWith('electron-') || String(this.options.target || '').startsWith('nwjs-') || String(this.options.target || '') === 'webview-mac';
+    const cspNonce = useSecureCsp ? bytesToBase64(randomBytes(16)).replace(/=+$/g, '') : '';
+    this._wbCspNonce = cspNonce;
+    const scriptNonceAttr = useSecureCsp ? ` nonce="${cspNonce}"` : '';
     const csp = useSecureCsp
-      ? "default-src 'self' data: blob:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' blob:; connect-src 'self' https: http: ws: wss:; media-src 'self' data: blob:; worker-src 'self' blob:;"
+      ? `default-src 'none'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'none'; img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'nonce-${cspNonce}'; script-src-attr 'none'; connect-src 'self' https: http: ws: wss:${isLocalTarget ? " file:" : ""}; worker-src 'self' blob:;`
       : "default-src * 'self' 'unsafe-inline' 'unsafe-eval' data: blob:";
     let html = useCleanTemplate ? encodeBigString`<!DOCTYPE html>
 <html lang="en">
@@ -2754,8 +2982,8 @@ cd "$(dirname "$0")"
     </div>
   </div>
 
-  ${this.options.target === 'html' ? `<script>${this.script}</script>` : '<script src="script.js"></script>'}
-  <script>${removeUnnecessaryEmptyLines(`
+  ${this.options.target === 'html' ? `<script${scriptNonceAttr}>${this.script}</script>` : `<script src="script.js"${scriptNonceAttr}></script>`}
+  <script${scriptNonceAttr}>${removeUnnecessaryEmptyLines(`
     const appElement = document.getElementById('app');
     const launchScreen = document.getElementById('launch');
     const loadingScreen = document.getElementById('loading');
@@ -2766,6 +2994,7 @@ cd "$(dirname "$0")"
 
     const handleError = (err) => {
       try { console.error(err); } catch (e) { }
+      try { wbLog && wbLog('error', 'runtime error', String(err && (err.stack || err))); } catch (e) { }
       if (!errorScreen.hidden) return;
       errorScreen.hidden = false;
       if (loadingScreen) loadingScreen.hidden = true;
@@ -2781,6 +3010,22 @@ cd "$(dirname "$0")"
       loadingBar.style.width = (clamped * 100) + '%';
     };
     const interpolate = (a, b, t) => a + t * (b - a);
+    const WB_DEBUG = ${JSON.stringify(!!(this.options.wb && this.options.wb.debugLog))};
+    const WB_VERBOSE = ${JSON.stringify(!!(this.options.wb && this.options.wb.debugLogVerbose))};
+    const WB_SECURE_CSP = ${JSON.stringify(useSecureCsp)};
+    const wbLog = (level, message, data) => {
+      if (!WB_DEBUG) return;
+      const m = String(message || '');
+      try {
+        const fn = (level === 'error' && console.error) ? console.error : console.log;
+        fn.call(console, '[wb]', m, data || '');
+      } catch (e) {}
+      try {
+        if (window.EditorPreload && typeof window.EditorPreload.wbLog === 'function') {
+          window.EditorPreload.wbLog(level || 'info', m, data);
+        }
+      } catch (e) {}
+    };
 
     try {
       setProgress(${PROGRESS_LOADED_SCRIPTS});
@@ -2809,25 +3054,42 @@ cd "$(dirname "$0")"
 
       scaffolding.setExtensionSecurityManager({getSandboxMode: () => 'unsandboxed', canLoadExtensionFromProject: () => true});
       for (const extensionURL of ${JSON.stringify(await this.generateExtensionURLs())}) {
+        if (WB_VERBOSE) wbLog('info', 'loadExtensionURL', extensionURL);
         vm.extensionManager.loadExtensionURL(extensionURL);
       }
 
+      const wbReadFailures = [];
       const readFileOrFetch = async (path) => {
         if (window.EditorPreload && typeof window.EditorPreload.readFile === 'function') {
-          const data = await window.EditorPreload.readFile(path);
-          if (data instanceof Uint8Array) return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
-          if (data instanceof ArrayBuffer) return data;
-          return new Uint8Array(data).buffer;
+          try {
+            const data = await window.EditorPreload.readFile(path);
+            if (data instanceof Uint8Array) return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+            if (data instanceof ArrayBuffer) return data;
+            return new Uint8Array(data).buffer;
+          } catch (e) {
+            const err = String(e && (e.stack || e));
+            wbReadFailures.push({path, via: 'preload', error: err});
+            if (WB_VERBOSE) wbLog('info', 'EditorPreload.readFile failed, falling back to fetch', {path, error: err});
+          }
         }
-        const res = await fetch(path, {cache: 'no-store'});
-        if (!res.ok) throw new Error('Failed to load: ' + path);
-        return await res.arrayBuffer();
+        try {
+          const res = await fetch(path, {cache: 'no-store'});
+          if (!res.ok) throw new Error('Failed to load: ' + path + ' (' + res.status + ')');
+          return await res.arrayBuffer();
+        } catch (e) {
+          const err = String(e && (e.stack || e));
+          wbReadFailures.push({path, via: 'fetch', error: err});
+          throw e;
+        }
       };
 
       const tryRead = async (path) => {
         try {
-          return await readFileOrFetch(path);
+          const ab = await readFileOrFetch(path);
+          if (WB_VERBOSE) wbLog('info', 'read ok', {path, bytes: ab ? ab.byteLength : 0});
+          return ab;
         } catch (e) {
+          if (WB_VERBOSE) wbLog('info', 'read failed', {path, error: String(e && (e.stack || e))});
           return null;
         }
       };
@@ -2867,6 +3129,17 @@ cd "$(dirname "$0")"
                   meta = null;
                 }
               }
+              if (!meta) {
+                const ab2 = await tryRead('./assets/wb-res/meta.json');
+                if (ab2) {
+                  try {
+                    const text2 = new TextDecoder().decode(new Uint8Array(ab2));
+                    meta = JSON.parse(text2);
+                  } catch (e) {
+                    meta = null;
+                  }
+                }
+              }
             }
             if (!meta || !meta.parts || !meta.order || !meta.salt || !meta.map) {
               meta = null;
@@ -2893,20 +3166,41 @@ cd "$(dirname "$0")"
           })();
           return initPromise;
         };
-        const normalizeRequest = (p) => {
+        const getKeyCandidates = (p) => {
           let s = String(p || '');
           s = s.replace(/^[.][\\/]/, '');
           s = s.replace(/^[/\\\\]+/, '');
-          if (s === 'assets/project.json') return 'project.json';
-          if (s.startsWith('assets/')) return s.slice('assets/'.length);
-          return s;
+          const keys = [];
+          keys.push(s);
+          if (s === 'assets/project.json') keys.push('project.json');
+          if (s === 'project.json') keys.push('assets/project.json');
+          if (s.startsWith('assets/')) keys.push(s.slice('assets/'.length));
+          const slash = s.lastIndexOf('/');
+          if (slash !== -1) keys.push(s.slice(slash + 1));
+          const seen = new Set();
+          const out = [];
+          for (const k of keys) {
+            if (!k || seen.has(k)) continue;
+            seen.add(k);
+            out.push(k);
+          }
+          return out;
         };
         const loadPacked = async (path) => {
           await ensure();
           if (!meta || !keyBytes || !saltBytes) return null;
-          const key = normalizeRequest(path);
-          const packedPath = meta.map[key];
-          if (!packedPath) return null;
+          const keys = getKeyCandidates(path);
+          let packedPath = null;
+          let key = null;
+          for (const k of keys) {
+            const p = meta.map[k];
+            if (p) {
+              packedPath = p;
+              key = k;
+              break;
+            }
+          }
+          if (!packedPath || !key) return null;
           const ab = await tryRead('./' + packedPath);
           if (!ab) return null;
           const data = new Uint8Array(ab);
@@ -3066,43 +3360,53 @@ cd "$(dirname "$0")"
         };
 
         const enc = window.__WB_ENC__;
-        const hasEnc = !!(enc && enc.k && enc.iv);
+        const ivB64 = (enc && enc.v === 2 && enc.project && enc.project.iv) ? enc.project.iv : (enc && enc.iv);
+        const hasEnc = !!(enc && enc.k && ivB64);
         const base64ToBytes = (b64) => Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+        if (WB_DEBUG) wbLog('info', 'loadProjectData start', {hasEnc});
 
         const tryLoadEncrypted = async () => {
           if (!hasEnc) return null;
           const parts = enc && enc.shred && Number(enc.shred.parts);
           const keyBytes = base64ToBytes(enc.k);
-          const ivBytes = base64ToBytes(enc.iv);
+          const ivBytes = base64ToBytes(ivB64);
+          if (WB_DEBUG) wbLog('info', 'tryLoadEncrypted', {parts: parts || 0});
           if (parts && parts > 1) {
             const order = await computeShardOrder(keyBytes, ivBytes, 'wb-project', parts);
             const buffers = [];
             for (let i = 0; i < parts; i++) {
               const physical = order[i];
-              const b = await tryRead('./wb-project.' + physical + '.wb');
+              const b = await tryRead('./wb-project.' + physical + '.wb') || await tryRead('./assets/wb-project.' + physical + '.wb');
               if (!b) return null;
               buffers.push(b);
             }
             const ciphertext = concatBuffers(buffers);
             const plain = await aesGcmDecrypt(ciphertext, keyBytes, ivBytes);
+            if (WB_DEBUG) wbLog('info', 'encrypted project decrypted', {bytes: plain ? plain.byteLength : 0});
             return await loadProjectZip(plain);
           }
-          const b = await tryRead('./wb-project.bin');
+          const b = await tryRead('./wb-project.bin') || await tryRead('./assets/wb-project.bin');
           if (!b) return null;
           const plain = await aesGcmDecrypt(b, keyBytes, ivBytes);
+          if (WB_DEBUG) wbLog('info', 'encrypted project decrypted', {bytes: plain ? plain.byteLength : 0});
           return await loadProjectZip(plain);
         };
 
         const encrypted = await tryLoadEncrypted();
-        if (encrypted) return encrypted;
+        if (encrypted) {
+          if (WB_DEBUG) wbLog('info', 'project source', 'encrypted');
+          return encrypted;
+        }
 
-        const zipBuffer = await tryRead('./project.zip');
+        const zipBuffer = await tryRead('./project.zip') || await tryRead('./assets/project.zip');
         if (zipBuffer) {
+          if (WB_DEBUG) wbLog('info', 'project source', 'project.zip');
           return await loadProjectZip(zipBuffer);
         }
 
         const packedProject = await wbResPack.loadProject();
         if (packedProject) {
+          if (WB_DEBUG) wbLog('info', 'project source', 'wb-res');
           storage.addHelper({
             load: async (assetType, assetId, dataFormat) => {
               const ab = await wbResPack.loadAsset(assetId, dataFormat);
@@ -3122,8 +3426,30 @@ cd "$(dirname "$0")"
           ].filter(i => i),
           (asset) => new URL('./assets/' + asset.assetId + '.' + asset.dataFormat, location).href
         );
-        const pj = await readFileOrFetch('./assets/project.json');
-        return pj;
+        const pj1 = await tryRead('./assets/project.json');
+        if (pj1) return pj1;
+        const pj2 = await tryRead('./project.json');
+        if (pj2) return pj2;
+        const debugChecks = {
+          'wb-res/meta.json': !!(await tryRead('./wb-res/meta.json')),
+          'assets/wb-res/meta.json': !!(await tryRead('./assets/wb-res/meta.json')),
+          'project.zip': !!(await tryRead('./project.zip')),
+          'assets/project.zip': !!(await tryRead('./assets/project.zip')),
+          'wb-project.bin': !!(await tryRead('./wb-project.bin')),
+          'assets/wb-project.bin': !!(await tryRead('./assets/wb-project.bin')),
+          'assets/project.json': !!(await tryRead('./assets/project.json')),
+          'project.json': !!(await tryRead('./project.json')),
+        };
+        const env = {
+          href: location && location.href,
+          protocol: location && location.protocol,
+          origin: location && location.origin,
+          secureCsp: WB_SECURE_CSP,
+          hasEditorPreload: !!(window.EditorPreload && typeof window.EditorPreload.readFile === 'function')
+        };
+        const recentFailures = wbReadFailures.slice(-12);
+        if (WB_DEBUG) wbLog('error', 'missing project.json', {env, debugChecks, recentFailures});
+        throw new Error('Missing project.json; checked: ' + JSON.stringify(debugChecks) + '\\nEnv: ' + JSON.stringify(env) + '\\nRead failures: ' + JSON.stringify(recentFailures));
       };
 
       window.__wbStart = async () => {
@@ -3154,10 +3480,10 @@ cd "$(dirname "$0")"
     }
   `)}</script>
 
-  ${this.options.custom.js ? `<script>
+  ${this.options.custom.js ? `<script${scriptNonceAttr}>
     try { ${this.options.custom.js} } catch (e) { handleError(e); }
   </script>` : ''}
-  ${this.options.wb && this.options.wb.encryptProject ? `<script>window.__WB_ENC__ = ${JSON.stringify(this.wbEncryption ? Object.assign({}, this.wbEncryption, (this.options.wb && this.options.wb.shredWbResources) ? {shred: {parts: 32}} : null) : null)};</script>` : ''}
+  ${this.options.wb && this.options.wb.encryptProject ? `<script${scriptNonceAttr}>window.__WB_ENC__ = ${JSON.stringify(this.wbEncryption ? Object.assign({}, this.wbEncryption, (this.options.wb && this.options.wb.shredWbResources) ? {shred: {parts: 32}} : null) : null)};</script>` : ''}
 </body>
 </html>
 ` : encodeBigString`<!DOCTYPE html>
@@ -3340,8 +3666,8 @@ cd "$(dirname "$0")"
     </details>
   </div>
 
-  ${this.options.target === 'html' ? `<script>${this.script}</script>` : '<script src="script.js"></script>'}
-  <script>${removeUnnecessaryEmptyLines(`
+  ${this.options.target === 'html' ? `<script${scriptNonceAttr}>${this.script}</script>` : `<script src="script.js"${scriptNonceAttr}></script>`}
+  <script${scriptNonceAttr}>${removeUnnecessaryEmptyLines(`
     const appElement = document.getElementById('app');
     const launchScreen = document.getElementById('launch');
     const loadingScreen = document.getElementById('loading');
@@ -3569,7 +3895,7 @@ cd "$(dirname "$0")"
       handleError(e);
     }
   `)}</script>
-  ${this.options.custom.js ? `<script>
+  ${this.options.custom.js ? `<script${scriptNonceAttr}>
     try {
       ${this.options.custom.js}
     } catch (e) {
@@ -3577,7 +3903,7 @@ cd "$(dirname "$0")"
     }
   </script>` : ''}
   ${await this.generateGetProjectData()}
-  <script>
+  <script${scriptNonceAttr}>
     const run = async () => {
       const projectData = await getProjectData();
       await scaffolding.loadProject(projectData);
@@ -3608,7 +3934,7 @@ cd "$(dirname "$0")"
     if (encryptRuntime) {
       const htmlText = new TextDecoder().decode(html);
       const inlineScripts = [];
-      const scriptRegex = /<script>([\s\S]*?)<\/script>/g;
+      const scriptRegex = /<script[^>]*>([\s\S]*?)<\/script>/g;
       let m;
       while ((m = scriptRegex.exec(htmlText)) !== null) {
         inlineScripts.push(m[1] || '');
@@ -3638,10 +3964,10 @@ cd "$(dirname "$0")"
 
       let shell = htmlText
         .replace(/<script[^>]*src="script\.js"[^>]*><\/script>/g, '')
-        .replace(/<script>[\s\S]*?<\/script>/g, '');
+        .replace(/<script[^>]*>[\s\S]*?<\/script>/g, '');
 
-      const bootstrapMeta = `window.__WB_APP__ = ${JSON.stringify({k: this.wbEncryption.k, iv: bytesToBase64(ivBytes), shred: (encryptRuntime && shredWbResources) ? {parts: 32} : null})};`;
-      let bootstrap = `(async()=>{try{const app=document.getElementById('app');const loading=document.getElementById('loading');const errorScreen=document.getElementById('error');const errorMessage=document.getElementById('error-message');const errorStack=document.getElementById('error-stack');const handle=(e)=>{try{console.error(e);}catch(_){ }if(errorScreen){errorScreen.hidden=false;if(errorMessage)errorMessage.textContent=''+e;if(errorStack)errorStack.textContent=(e&&e.stack?e.stack:'no stack')+'\\nUser agent: '+navigator.userAgent;}else{alert(''+e);}};const meta=window.__WB_APP__;if(!meta||!meta.k||!meta.iv)throw new Error('Missing app metadata');const b64ToBytes=(b64)=>Uint8Array.from(atob(b64),c=>c.charCodeAt(0));const keyBytes=b64ToBytes(meta.k);const ivBytes=b64ToBytes(meta.iv);const key=await crypto.subtle.importKey('raw',keyBytes,{name:'AES-GCM'},false,['decrypt']);const load=(p)=>{if(window.EditorPreload&&typeof window.EditorPreload.readFile==='function'){return Promise.resolve(window.EditorPreload.readFile(p)).then(x=>x instanceof Uint8Array?x:new Uint8Array(x));}return new Promise((resolve,reject)=>{const xhr=new XMLHttpRequest();xhr.onload=()=>resolve(new Uint8Array(xhr.response));xhr.onerror=()=>reject(new Error('Failed to load app payload'));xhr.responseType='arraybuffer';xhr.open('GET',p);xhr.send();});};let data=null;const parts=meta&&meta.shred&&Number(meta.shred.parts);if(parts&&parts>1){const labelBytes=new TextEncoder().encode('wb-app');const combined=new Uint8Array(keyBytes.length+ivBytes.length+labelBytes.length);combined.set(keyBytes,0);combined.set(ivBytes,keyBytes.length);combined.set(labelBytes,keyBytes.length+ivBytes.length);let seed=0;if(crypto&&crypto.subtle&&crypto.subtle.digest){const digest=await crypto.subtle.digest('SHA-256',combined);seed=new DataView(digest).getUint32(0,false)>>>0;}const xorshift32=(x)=>{x^=x<<13;x^=x>>>17;x^=x<<5;return x>>>0;};const order=Array.from({length:parts},(_,i)=>i);let s=seed>>>0;for(let i=order.length-1;i>0;i--){s=xorshift32(s);const j=s%(i+1);const t=order[i];order[i]=order[j];order[j]=t;}const bufs=[];let total=0;for(let i=0;i<parts;i++){const physical=order[i];const b=await load('./wb-app.'+physical+'.wb');bufs.push(b);total+=b.length;}const out=new Uint8Array(total);let o=0;for(const b of bufs){out.set(b,o);o+=b.length;}data=out.buffer;}else{const b=await load('./wb-app.bin');data=b.buffer;}const plain=await crypto.subtle.decrypt({name:'AES-GCM',iv:ivBytes},key,data);const code=new TextDecoder('utf-8').decode(new Uint8Array(plain));const s=document.createElement('script');s.textContent=code;(document.head||document.documentElement).appendChild(s);}catch(e){handle(e);}})();`;
+      const bootstrapMeta = `window.__WB_APP__ = ${JSON.stringify({k: this.wbEncryption.k, iv: bytesToBase64(ivBytes), shred: (encryptRuntime && shredWbResources) ? {parts: 32} : null, n: (useSecureCsp && cspNonce) ? cspNonce : null})};`;
+      let bootstrap = `(async()=>{try{const app=document.getElementById('app');const loading=document.getElementById('loading');const errorScreen=document.getElementById('error');const errorMessage=document.getElementById('error-message');const errorStack=document.getElementById('error-stack');const handle=(e)=>{try{console.error(e);}catch(_){ }if(errorScreen){errorScreen.hidden=false;if(errorMessage)errorMessage.textContent=''+e;if(errorStack)errorStack.textContent=(e&&e.stack?e.stack:'no stack')+'\\nUser agent: '+navigator.userAgent;}else{alert(''+e);}};const meta=window.__WB_APP__;if(!meta||!meta.k||!meta.iv)throw new Error('Missing app metadata');const b64ToBytes=(b64)=>Uint8Array.from(atob(b64),c=>c.charCodeAt(0));const keyBytes=b64ToBytes(meta.k);const ivBytes=b64ToBytes(meta.iv);const key=await crypto.subtle.importKey('raw',keyBytes,{name:'AES-GCM'},false,['decrypt']);const load=(p)=>{if(window.EditorPreload&&typeof window.EditorPreload.readFile==='function'){return Promise.resolve(window.EditorPreload.readFile(p)).then(x=>x instanceof Uint8Array?x:new Uint8Array(x));}return new Promise((resolve,reject)=>{const xhr=new XMLHttpRequest();xhr.onload=()=>resolve(new Uint8Array(xhr.response));xhr.onerror=()=>reject(new Error('Failed to load app payload'));xhr.responseType='arraybuffer';xhr.open('GET',p);xhr.send();});};let data=null;const parts=meta&&meta.shred&&Number(meta.shred.parts);if(parts&&parts>1){const labelBytes=new TextEncoder().encode('wb-app');const combined=new Uint8Array(keyBytes.length+ivBytes.length+labelBytes.length);combined.set(keyBytes,0);combined.set(ivBytes,keyBytes.length);combined.set(labelBytes,keyBytes.length+ivBytes.length);let seed=0;if(crypto&&crypto.subtle&&crypto.subtle.digest){const digest=await crypto.subtle.digest('SHA-256',combined);seed=new DataView(digest).getUint32(0,false)>>>0;}const xorshift32=(x)=>{x^=x<<13;x^=x>>>17;x^=x<<5;return x>>>0;};const order=Array.from({length:parts},(_,i)=>i);let s=seed>>>0;for(let i=order.length-1;i>0;i--){s=xorshift32(s);const j=s%(i+1);const t=order[i];order[i]=order[j];order[j]=t;}const bufs=[];let total=0;for(let i=0;i<parts;i++){const physical=order[i];const b=await load('./wb-app.'+physical+'.wb');bufs.push(b);total+=b.length;}const out=new Uint8Array(total);let o=0;for(const b of bufs){out.set(b,o);o+=b.length;}data=out.buffer;}else{const b=await load('./wb-app.bin');data=b.buffer;}const plain=await crypto.subtle.decrypt({name:'AES-GCM',iv:ivBytes},key,data);const code=new TextDecoder('utf-8').decode(new Uint8Array(plain));const s=document.createElement('script');try{if(meta&&meta.n)s.setAttribute('nonce',meta.n);}catch(_){ }s.textContent=code;(document.head||document.documentElement).appendChild(s);}catch(e){handle(e);}})();`;
       if (this.options.wb && this.options.wb.obfuscateUnpack) {
         bootstrap = JavaScriptObfuscator.obfuscate(bootstrap, {
           compact: true,
@@ -3656,7 +3982,7 @@ cd "$(dirname "$0")"
         }).getObfuscatedCode();
       }
 
-      const injected = `<script>${bootstrapMeta}\n${bootstrap}</script>`;
+      const injected = `<script${scriptNonceAttr}>${bootstrapMeta}\n${bootstrap}</script>`;
       outputHTML = new TextEncoder().encode(shell.replace('</body>', `${injected}\n</body>`));
     }
     this.ensureNotAborted();
@@ -3692,6 +4018,16 @@ cd "$(dirname "$0")"
           zip.file('project.zip', this.project.arrayBuffer);
         }
       }
+      try {
+        const extFiles = this._embeddedExtensionFiles && typeof this._embeddedExtensionFiles === 'object' ? this._embeddedExtensionFiles : null;
+        if (extFiles) {
+          for (const [p, code] of Object.entries(extFiles)) {
+            if (typeof p === 'string' && p && typeof code === 'string') {
+              zip.file(p, code);
+            }
+          }
+        }
+      } catch (e) {}
       zip.file('index.html', outputHTML);
       if (encryptRuntime) {
         if (shredWbResources) {
@@ -3735,7 +4071,7 @@ cd "$(dirname "$0")"
           const indexFile = zip.file('index.html');
           if (indexFile) {
             const htmlBytes = await indexFile.async('uint8array');
-            zip.file('index.html', injectWbResMetaIntoHtml(htmlBytes, meta));
+            zip.file('index.html', injectWbResMetaIntoHtml(htmlBytes, meta, this._wbCspNonce));
           }
         } catch (e) {
           console.warn(e);
@@ -3863,6 +4199,9 @@ Packager.DEFAULT_OPTIONS = () => ({
   app: {
     icon: null,
     writeWindowsExeIcon: true,
+    exportWindowsIco: false,
+    writeMacElectronIcns: true,
+    exportLinuxDesktopFile: false,
     packageName: Packager.getDefaultPackageNameFromFileName(''),
     windowTitle: Packager.getWindowTitleFromFileName(''),
     windowMode: 'window',
@@ -3908,6 +4247,9 @@ Packager.DEFAULT_OPTIONS = () => ({
     splitElectronEntry: false,
     shredWbResources: false,
     cleanHtmlTemplate: false,
+    extensionLoadStrategy: 'auto',
+    debugLog: false,
+    debugLogVerbose: false,
     enablePluginDir: false,
     pluginDir: 'plugins',
     obfuscateUnpack: true,
