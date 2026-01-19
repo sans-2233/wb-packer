@@ -264,6 +264,12 @@
     "icon": {
       "string": "Page icon"
     },
+    "writeWindowsExeIcon": {
+      "string": "Windows: also apply icon to the generated .exe file"
+    },
+    "writeWindowsExeIconHelp": {
+      "string": "This affects the Windows executable's icon shown in Explorer/taskbar, not just the window icon."
+    },
     "controls": {
       "string": "Controls",
       "developer_comment": "Controls section header"

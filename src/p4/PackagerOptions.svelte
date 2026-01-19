@@ -508,6 +508,7 @@
     $loadingScreenImage = null;
     resetOptions([
       'app.windowTitle',
+      'app.writeWindowsExeIcon',
       'loadingScreen',
       'autoplay',
       'controls',
@@ -527,6 +528,13 @@
       {$_('options.icon')}
       <ImageInput bind:file={$icon} previewSizes={[[64, 64], [32, 32], [16, 16]]} />
     </div>
+    {#if $options.target.startsWith('electron-win')}
+      <label class="option">
+        <input type="checkbox" bind:checked={$options.app.writeWindowsExeIcon}>
+        {$_('options.writeWindowsExeIcon')}
+      </label>
+      <p>{$_('options.writeWindowsExeIconHelp')}</p>
+    {/if}
 
     <h3>{$_('options.loadingScreen')}</h3>
     <label class="option">
@@ -838,11 +846,15 @@
       </label>
       <label class="option">
         <input type="checkbox" bind:checked={$options.wb.opcodeObfuscation} />
-        混淆 opcode（生成随机映射表并写入作品）
+        混淆 opcode（必须引入wb-scratchvm依赖才能使用 不然会导致作品卡死）
       </label>
       <label class="option">
         <input type="checkbox" bind:checked={$options.wb.splitElectronEntry} />
         拆分 Electron 入口（将主进程/预加载拆成多个分片加载）
+      </label>
+      <label class="option">
+        <input type="checkbox" bind:checked={$options.wb.packResourcesXor} />
+        资源封包(实现很简单!不要指望能当作加密来用 只能防止直接提取)
       </label>
       <div class="group">
         <Button on:click={openPlugins} secondary text="插件系统" />

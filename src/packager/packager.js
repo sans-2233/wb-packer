@@ -15,6 +15,7 @@ import {darken} from './colors';
 import {Adapter} from './adapter';
 import encodeBigString from './encode-big-string';
 import {loadPluginsFromDir, loadPluginsFromDesktopPreload, runHookChain} from './plugin-system';
+import {patchWindowsExecutableIcon} from './windows/patch-exe-icon';
 
 const PROGRESS_LOADED_SCRIPTS = 0.1;
 
@@ -46,6 +47,38 @@ const sha256HexOfBytes = (bytes) => {
   const hash = new SHA256();
   hash.update(bytes);
   return hash.digest('hex');
+};
+
+const stableIntegrityManifestString = (manifest) => {
+  const files = manifest && manifest.files && typeof manifest.files === 'object' ? manifest.files : {};
+  const sortedFiles = {};
+  for (const k of Object.keys(files).sort()) {
+    sortedFiles[k] = files[k];
+  }
+  const normalized = {
+    v: 1,
+    kid: String(manifest && manifest.kid ? manifest.kid : ''),
+    files: sortedFiles
+  };
+  return JSON.stringify(normalized);
+};
+
+const buildIntegrityManifestForPrefix = async (zip, resourcesPrefix, excludeRel) => {
+  const files = {};
+  const exclude = excludeRel && typeof excludeRel.has === 'function' ? excludeRel : null;
+  for (const fullPath of Object.keys(zip.files || {})) {
+    if (!fullPath.startsWith(resourcesPrefix)) continue;
+    if (zip.files[fullPath] && zip.files[fullPath].dir) continue;
+    const rel = fullPath.slice(resourcesPrefix.length);
+    if (!rel || rel.endsWith('/')) continue;
+    if (exclude && exclude.has(rel)) continue;
+    const data = await zip.file(fullPath).async('uint8array');
+    files[rel] = {
+      sha256: sha256HexOfBytes(data),
+      size: data.length
+    };
+  }
+  return {v: 1, kid: '', files};
 };
 
 const stableObfuscatedName = (prefix, id) => `${prefix}${sha256HexOfString(id).substring(0, 10)}`;
@@ -119,6 +152,14 @@ const xorCrypt = (bytes, keyBytes, seed) => {
   return out;
 };
 
+const normalizePackedResourceKey = (zipPath) => {
+  if (zipPath === 'project.json' || zipPath.endsWith('/project.json')) return 'project.json';
+  if (zipPath.startsWith('assets/')) return zipPath.slice('assets/'.length);
+  const slash = zipPath.lastIndexOf('/');
+  if (slash !== -1) return zipPath.slice(slash + 1);
+  return zipPath;
+};
+
 const bytesToBase64 = (bytes) => {
   let binary = '';
   const chunkSize = 0x8000;
@@ -190,6 +231,37 @@ const splitIntoShards = (bytes, count) => {
     off += size;
   }
   return shards;
+};
+
+const buildXorResourcePackMeta = (projectId, keyBytes, saltBytes, partCount = 8) => {
+  const shards = splitIntoShards(keyBytes, partCount);
+  const seed = shardSeed(keyBytes, saltBytes, `wb-res:${String(projectId || '')}`);
+  const order = shuffledIndices(partCount, seed);
+  const parts = Array(partCount);
+  for (let i = 0; i < partCount; i++) {
+    const physical = order[i];
+    const obf = xorCrypt(shards[i], saltBytes, i & 0xff);
+    parts[physical] = bytesToBase64(obf);
+  }
+  return {
+    v: 1,
+    salt: bytesToBase64(saltBytes),
+    order,
+    parts,
+    map: {}
+  };
+};
+
+const injectWbResMetaIntoHtml = (htmlBytes, meta) => {
+  try {
+    const text = new TextDecoder().decode(htmlBytes);
+    if (text.includes('window.__WB_RSP__')) return htmlBytes;
+    const injected = text.replace('</body>', `<script>window.__WB_RSP__=${JSON.stringify(meta)};</script></body>`);
+    if (injected === text) return htmlBytes;
+    return new TextEncoder().encode(injected);
+  } catch (e) {
+    return htmlBytes;
+  }
 };
 
 const splitString = (string, count) => {
@@ -837,6 +909,16 @@ cd "$(dirname "$0")"
 
     const icon = await Adapter.getAppIcon(this.options.app.icon);
     zip.file(`${resourcesPrefix}${iconName}`, icon);
+    if (isWindows && this.options.app.writeWindowsExeIcon !== false) {
+      try {
+        const exePath = `${rootPrefix}${packageName}.exe`;
+        const exe = await zip.file(exePath).async('arraybuffer');
+        const patchedExe = await patchWindowsExecutableIcon(exe, icon);
+        zip.file(exePath, patchedExe);
+      } catch (e) {
+        console.warn(e);
+      }
+    }
 
     const manifest = {
       name: packageName,
@@ -850,8 +932,49 @@ cd "$(dirname "$0")"
     const wbDisableDevtools = wbProtectElectron || !(this.options.wb && this.options.wb.disableDevtools === false);
     const wbVerifyScriptHash = !(this.options.wb && this.options.wb.verifyScriptHash === false);
     const wbVerifyIndexHash = !(this.options.wb && this.options.wb.verifyIndexHash === false);
+    const wbIntegrity = (this.options.wb && this.options.wb.integrity && typeof this.options.wb.integrity === 'object')
+      ? this.options.wb.integrity
+      : null;
+    const wbIntegrityEnabled = !!(wbIntegrity && wbIntegrity.enabled);
+    const wbIntegrityRequired = !!(wbIntegrity && wbIntegrity.required);
+    const wbIntegrityManifestName = (wbIntegrity && typeof wbIntegrity.manifestName === 'string' && wbIntegrity.manifestName) ? wbIntegrity.manifestName : 'wb-integrity.json';
+    const wbIntegritySignatureName = (wbIntegrity && typeof wbIntegrity.signatureName === 'string' && wbIntegrity.signatureName) ? wbIntegrity.signatureName : 'wb-integrity.sig';
+    let wbIntegrityPublicKeys = (wbIntegrity && wbIntegrity.publicKeys && typeof wbIntegrity.publicKeys === 'object') ? wbIntegrity.publicKeys : {};
+    let wbIntegrityKid = (wbIntegrity && typeof wbIntegrity.kid === 'string') ? wbIntegrity.kid : '';
+
     const indexHTML = projectZip.file('index.html') ? await projectZip.file('index.html').async('string') : '';
     const expectedIndexHash = wbVerifyIndexHash ? sha256HexOfString(indexHTML) : null;
+
+    if (wbIntegrityEnabled) {
+      try {
+        const exclude = new Set([wbIntegrityManifestName, wbIntegritySignatureName]);
+        const integrityManifest = await buildIntegrityManifestForPrefix(zip, resourcesPrefix, exclude);
+        if (wbIntegrityKid) integrityManifest.kid = wbIntegrityKid;
+        const integrityManifestText = stableIntegrityManifestString(integrityManifest);
+        const signResult = await this.runPluginHook('signIntegrityManifest', {
+          manifestText: integrityManifestText,
+          manifest: integrityManifest,
+          publicKeys: wbIntegrityPublicKeys
+        }, {phase: 'signIntegrityManifest'});
+        const resultObj = signResult && typeof signResult === 'object' ? signResult : null;
+        if (resultObj) {
+          if (typeof resultObj.kid === 'string' && resultObj.kid) {
+            wbIntegrityKid = resultObj.kid;
+            integrityManifest.kid = wbIntegrityKid;
+          }
+          if (resultObj.publicKeys && typeof resultObj.publicKeys === 'object') {
+            wbIntegrityPublicKeys = resultObj.publicKeys;
+          }
+        }
+        const finalManifestText = stableIntegrityManifestString(integrityManifest);
+        zip.file(resourcesPrefix + wbIntegrityManifestName, finalManifestText);
+        if (resultObj && resultObj.signature) {
+          zip.file(resourcesPrefix + wbIntegritySignatureName, resultObj.signature);
+        }
+      } catch (e) {
+        console.warn(e);
+      }
+    }
 
     let mainJS = `'use strict';
 const {app, BrowserWindow, Menu, shell, screen, dialog, ipcMain} = require('electron');
@@ -885,8 +1008,50 @@ const defaultProjectURL = new URL('./index.html', resourcesURL).href;
 ${wbVerifyScriptHash ? `const expectedScriptHash = ${JSON.stringify(this.wbAppIntegrity ? this.wbAppIntegrity.sha256 : sha256HexOfString(this.script))};` : ''}
 ${wbVerifyIndexHash ? `const expectedIndexHash = ${JSON.stringify(expectedIndexHash)};` : ''}
 const wbIntegrityFile = ${JSON.stringify(this.wbAppIntegrity ? this.wbAppIntegrity.file : 'script.js')};
+const WB_INTEGRITY_REQUIRED = ${JSON.stringify(wbIntegrityRequired)};
+const WB_INTEGRITY_MANIFEST = ${JSON.stringify(wbIntegrityManifestName)};
+const WB_INTEGRITY_SIGNATURE = ${JSON.stringify(wbIntegritySignatureName)};
+const WB_INTEGRITY_KEYS = ${JSON.stringify(wbIntegrityPublicKeys || {})};
+
+const verifySignedIntegrityManifest = () => {
+  try {
+    const manifestPath = path.join(__dirname, WB_INTEGRITY_MANIFEST);
+    const sigPath = path.join(__dirname, WB_INTEGRITY_SIGNATURE);
+    if (!fs.existsSync(manifestPath) || !fs.existsSync(sigPath)) {
+      return !WB_INTEGRITY_REQUIRED;
+    }
+    const manifestBytes = fs.readFileSync(manifestPath);
+    const signature = fs.readFileSync(sigPath);
+    const manifest = JSON.parse(manifestBytes.toString('utf8'));
+    const kid = manifest && typeof manifest.kid === 'string' ? manifest.kid : '';
+    const pub = WB_INTEGRITY_KEYS[kid];
+    if (!pub) return false;
+    const ok = crypto.verify('sha256', manifestBytes, pub, signature);
+    if (!ok) return false;
+    const files = manifest && manifest.files && typeof manifest.files === 'object' ? manifest.files : null;
+    if (!files) return false;
+    for (const rel of Object.keys(files)) {
+      if (typeof rel !== 'string' || !rel) return false;
+      const expected = files[rel] && typeof files[rel].sha256 === 'string' ? files[rel].sha256 : '';
+      if (!expected) return false;
+      const abs = path.join(__dirname, rel);
+      const normalized = path.normalize(abs);
+      if (!normalized.startsWith(path.normalize(__dirname + path.sep))) return false;
+      const data = fs.readFileSync(abs);
+      const actual = crypto.createHash('sha256').update(data).digest('hex');
+      if (actual !== expected) return false;
+    }
+    return true;
+  } catch (e) {
+    return false;
+  }
+};
 
 const verifyIntegrity = () => {
+  if (!verifySignedIntegrityManifest()) {
+    app.exit(2);
+    return false;
+  }
   if (!${JSON.stringify(wbVerifyScriptHash)} && !${JSON.stringify(wbVerifyIndexHash)}) return true;
   try {
     if (${JSON.stringify(wbVerifyScriptHash)}) {
@@ -1706,12 +1871,13 @@ cd "$(dirname "$0")"
     let storageProgressEnd;
 
     const encryptProject = !!(this.options.wb && this.options.wb.encryptProject && this.options.target !== 'html');
+    const packResourcesXor = !!(this.options.wb && this.options.wb.packResourcesXor);
     const shredWbResources = !!(encryptProject && this.options.wb && this.options.wb.shredWbResources);
     const obfuscateUnpack = !!(this.options.wb && this.options.wb.obfuscateUnpack);
     let wbUnpackHelpers = '';
     if (encryptProject) {
       const enc = this.wbEncryption;
-      if (!enc || !enc.k || !enc.iv) {
+      if (!enc || !enc.k || (!enc.iv && !(enc.v === 2 && enc.project && enc.project.iv))) {
         throw new Error('Missing encryption metadata');
       }
       result.push(`
@@ -1816,7 +1982,17 @@ cd "$(dirname "$0")"
       storageProgressStart = PROGRESS_FETCHED_COMPRESSED;
       storageProgressEnd = PROGRESS_EXTRACTED_COMPRESSED;
 
-      const projectData = new Uint8Array(this.project.arrayBuffer);
+      const originalProjectData = new Uint8Array(this.project.arrayBuffer);
+      let projectData = originalProjectData;
+      if (packResourcesXor && isZip) {
+        const keyBytes = randomBytes(32);
+        const saltBytes = randomBytes(16);
+        const meta = buildXorResourcePackMeta(this.options.projectId, keyBytes, saltBytes, 8);
+        const seed = (fileSeed('project') ^ saltBytes[0]) & 0xff;
+        meta.seed = seed;
+        projectData = xorCrypt(originalProjectData, keyBytes, seed);
+        result.push(`<script>window.__WB_PX__=${JSON.stringify(meta)};</script>`);
+      }
 
       // keep this up-to-date with base85.js
       result.push(`
@@ -1865,7 +2041,37 @@ cd "$(dirname "$0")"
       getProjectDataFunction = `() => {
         const buffer = projectDecodeBuffer;
         projectDecodeBuffer = null; // Allow GC
-        return Promise.resolve(new Uint8Array(buffer, 0, ${projectData.length}));
+        let out = new Uint8Array(buffer, 0, ${projectData.length});
+        try {
+          const px = window.__WB_PX__;
+          if (px && px.parts && px.order && px.salt && Number.isFinite(px.seed)) {
+            const b64ToBytes = (b64) => Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+            const saltBytes = b64ToBytes(px.salt);
+            const xor = (bytes, keyBytes, seed) => {
+              const o = new Uint8Array(bytes.length);
+              for (let i = 0; i < bytes.length; i++) {
+                o[i] = bytes[i] ^ keyBytes[(i + seed) % keyBytes.length] ^ seed;
+              }
+              return o;
+            };
+            const partCount = px.parts.length;
+            const shards = [];
+            for (let i = 0; i < partCount; i++) {
+              const physical = px.order[i];
+              const obf = b64ToBytes(px.parts[physical]);
+              shards.push(xor(obf, saltBytes, i & 0xff));
+            }
+            const total = shards.reduce((a, b) => a + b.length, 0);
+            const keyBytes = new Uint8Array(total);
+            let off = 0;
+            for (const s of shards) {
+              keyBytes.set(s, off);
+              off += s.length;
+            }
+            out = xor(out, keyBytes, px.seed & 0xff);
+          }
+        } catch (e) {}
+        return Promise.resolve(out);
       }`;
     } else {
       let src;
@@ -1893,7 +2099,8 @@ cd "$(dirname "$0")"
           if (parts && parts > 1) {
             const base64ToBytes = (b64) => Uint8Array.from(atob(b64), c => c.charCodeAt(0));
             const keyBytes = base64ToBytes(enc.k);
-            const ivBytes = base64ToBytes(enc.iv);
+            const ivB64 = (enc && enc.v === 2 && enc.project && enc.project.iv) ? enc.project.iv : enc.iv;
+            const ivBytes = base64ToBytes(ivB64);
             const labelBytes = new TextEncoder().encode('wb-project');
             const combined = new Uint8Array(keyBytes.length + ivBytes.length + labelBytes.length);
             combined.set(keyBytes, 0);
@@ -1943,13 +2150,14 @@ cd "$(dirname "$0")"
             try {
               ${encryptProject ? `
               const enc = window.__WB_ENC__;
-              if (!enc || !enc.k || !enc.iv) throw new Error('Missing encryption metadata');
+              if (!enc || !enc.k || (!enc.iv && !(enc.v === 2 && enc.project && enc.project.iv))) throw new Error('Missing encryption metadata');
               if (!(crypto && crypto.subtle && crypto.subtle.importKey && crypto.subtle.decrypt)) {
                 throw new Error('WebCrypto is not available');
               }
               const base64ToBytes = (b64) => Uint8Array.from(atob(b64), c => c.charCodeAt(0));
               const keyBytes = base64ToBytes(enc.k);
-              const ivBytes = base64ToBytes(enc.iv);
+              const ivB64 = (enc && enc.v === 2 && enc.project && enc.project.iv) ? enc.project.iv : enc.iv;
+              const ivBytes = base64ToBytes(ivB64);
               const key = await crypto.subtle.importKey('raw', keyBytes, {name: 'AES-GCM'}, false, ['decrypt']);
               const plaintext = await crypto.subtle.decrypt({name: 'AES-GCM', iv: ivBytes}, key, data);
               resolve(plaintext);` : `
@@ -1965,13 +2173,14 @@ cd "$(dirname "$0")"
           try {
             ${encryptProject ? `
             const enc = window.__WB_ENC__;
-            if (!enc || !enc.k || !enc.iv) throw new Error('Missing encryption metadata');
+            if (!enc || !enc.k || (!enc.iv && !(enc.v === 2 && enc.project && enc.project.iv))) throw new Error('Missing encryption metadata');
             if (!(crypto && crypto.subtle && crypto.subtle.importKey && crypto.subtle.decrypt)) {
               throw new Error('WebCrypto is not available');
             }
             const base64ToBytes = (b64) => Uint8Array.from(atob(b64), c => c.charCodeAt(0));
             const keyBytes = base64ToBytes(enc.k);
-            const ivBytes = base64ToBytes(enc.iv);
+            const ivB64 = (enc && enc.v === 2 && enc.project && enc.project.iv) ? enc.project.iv : enc.iv;
+            const ivBytes = base64ToBytes(ivB64);
             const key = await crypto.subtle.importKey('raw', keyBytes, {name: 'AES-GCM'}, false, ['decrypt']);
             let ciphertext = xhr.response;
             const parts = enc && enc.shred && Number(enc.shred.parts);
@@ -2066,6 +2275,64 @@ cd "$(dirname "$0")"
         // Allow zip to be GC'd after project loads
         vm.runtime.on('PROJECT_LOADED', () => (zip = null));
         const findFileInZip = (path) => zip.file(path) || zip.file(new RegExp("^([^/]*/)?" + path + "$"))[0];
+        const initWbRes = (() => {
+          let ready = false;
+          let meta = null;
+          let keyBytes = null;
+          let saltBytes = null;
+          const b64ToBytes = (b64) => Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+          const seedFromName = (name) => {
+            let seed = 0;
+            for (let i = 0; i < name.length; i++) seed = (seed + name.charCodeAt(i)) & 0xff;
+            return seed;
+          };
+          const xor = (bytes, key, seed) => {
+            const out = new Uint8Array(bytes.length);
+            for (let i = 0; i < bytes.length; i++) {
+              out[i] = bytes[i] ^ key[(i + seed) % key.length] ^ seed;
+            }
+            return out;
+          };
+          const ensure = () => {
+            if (ready) return;
+            ready = true;
+            meta = (typeof window === 'object' && window) ? window.__WB_RSP__ : null;
+            if (!meta || !meta.parts || !meta.order || !meta.salt) {
+              meta = null;
+              return;
+            }
+            saltBytes = b64ToBytes(meta.salt);
+            const partCount = meta.parts.length;
+            const parts = meta.parts;
+            const order = meta.order;
+            const shards = [];
+            for (let i = 0; i < partCount; i++) {
+              const physical = order[i];
+              const shardObf = b64ToBytes(parts[physical]);
+              shards.push(xor(shardObf, saltBytes, i & 0xff));
+            }
+            const total = shards.reduce((a, b) => a + b.length, 0);
+            const out = new Uint8Array(total);
+            let off = 0;
+            for (const s of shards) {
+              out.set(s, off);
+              off += s.length;
+            }
+            keyBytes = out;
+          };
+          const tryLoad = async (requestedPath) => {
+            ensure();
+            if (!meta || !meta.map || !keyBytes || !saltBytes) return null;
+            const packedPath = meta.map[requestedPath];
+            if (!packedPath) return null;
+            const file = zip.file(packedPath) || zip.file(new RegExp("^([^/]*/)?" + packedPath + "$"))[0];
+            if (!file) return null;
+            const data = await file.async('uint8array');
+            const seed = (seedFromName(requestedPath) ^ saltBytes[0]) & 0xff;
+            return xor(data, keyBytes, seed);
+          };
+          return {tryLoad};
+        })();
         storage.addHelper({
           load: async (assetType, assetId, dataFormat) => {
             if (!zip) {
@@ -2073,11 +2340,16 @@ cd "$(dirname "$0")"
             }
             const path = assetId + '.' + dataFormat;
             const file = findFileInZip(path);
-            if (!file) {
-              console.error('Asset is not in zip: ' + path);
-              return Promise.resolve(null);
+            let data;
+            if (file) {
+              data = await file.async('uint8array');
+            } else {
+              data = await initWbRes.tryLoad(path);
+              if (!data) {
+                console.error('Asset is not in zip: ' + path);
+                return Promise.resolve(null);
+              }
             }
-            const data = await file.async('uint8array');
             if (window.__WB_UNPACK__) await window.__WB_UNPACK__.ensureInit(zip);
             const decrypted = window.__WB_UNPACK__ ? await window.__WB_UNPACK__.decryptAsset(path, data) : data;
             return storage.createAsset(assetType, dataFormat, decrypted, assetId);
@@ -2092,9 +2364,110 @@ cd "$(dirname "$0")"
           }
 
           const file = findFileInZip('project.json');
-          if (!file) throw new Error('project.json is not in zip');
+          if (!file) {
+            const packed = await initWbRes.tryLoad('project.json');
+            if (packed) return packed.buffer.slice(packed.byteOffset, packed.byteOffset + packed.byteLength);
+            throw new Error('project.json is not in zip');
+          }
           return file.async('arraybuffer');
-        });` : `
+        });` : (packResourcesXor && !encryptProject && this.project && this.project.type === 'sb3' && this.options.target !== 'zip-one-asset' ? `
+        const wbResState = {
+          ready: false,
+          initPromise: null,
+          helperInstalled: false,
+          meta: null,
+          keyBytes: null,
+          saltBytes: null
+        };
+        const readFileOrFetch = async (path) => {
+          if (window.EditorPreload && typeof window.EditorPreload.readFile === 'function') {
+            const data = await window.EditorPreload.readFile(path);
+            if (data instanceof Uint8Array) return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+            if (data instanceof ArrayBuffer) return data;
+            return new Uint8Array(data).buffer;
+          }
+          return await new Promise((resolve, reject) => {
+            const xhr = new XMLHttpRequest();
+            xhr.onload = () => resolve(xhr.response);
+            xhr.onerror = () => reject(new Error('Request failed: ' + path));
+            xhr.responseType = 'arraybuffer';
+            xhr.open('GET', path);
+            xhr.send();
+          });
+        };
+        const b64ToBytes = (b64) => Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+        const xor = (bytes, keyBytes, seed) => {
+          const out = new Uint8Array(bytes.length);
+          for (let i = 0; i < bytes.length; i++) {
+            out[i] = bytes[i] ^ keyBytes[(i + seed) % keyBytes.length] ^ seed;
+          }
+          return out;
+        };
+        const seedFromName = (name) => {
+          let seed = 0;
+          for (let i = 0; i < name.length; i++) seed = (seed + name.charCodeAt(i)) & 0xff;
+          return seed;
+        };
+        const initWbRes = async () => {
+          if (wbResState.ready) return;
+          if (wbResState.initPromise) return wbResState.initPromise;
+          wbResState.initPromise = (async () => {
+            const metaText = new TextDecoder().decode(new Uint8Array(await readFileOrFetch('./wb-res/meta.json')));
+            const meta = JSON.parse(metaText);
+            if (!meta || !meta.parts || !meta.order || !meta.salt || !meta.map) {
+              wbResState.ready = true;
+              return;
+            }
+            wbResState.meta = meta;
+            wbResState.saltBytes = b64ToBytes(meta.salt);
+            const shards = [];
+            for (let i = 0; i < meta.parts.length; i++) {
+              const physical = meta.order[i];
+              const shardObf = b64ToBytes(meta.parts[physical]);
+              shards.push(xor(shardObf, wbResState.saltBytes, i & 0xff));
+            }
+            const total = shards.reduce((a, b) => a + b.length, 0);
+            const keyBytes = new Uint8Array(total);
+            let off = 0;
+            for (const s of shards) {
+              keyBytes.set(s, off);
+              off += s.length;
+            }
+            wbResState.keyBytes = keyBytes;
+            wbResState.ready = true;
+          })();
+          return wbResState.initPromise;
+        };
+        const loadPacked = async (logicalPath) => {
+          await initWbRes();
+          if (!wbResState.meta || !wbResState.keyBytes || !wbResState.saltBytes) return null;
+          const packedPath = wbResState.meta.map[logicalPath];
+          if (!packedPath) return null;
+          const ab = await readFileOrFetch('./' + packedPath);
+          const data = new Uint8Array(ab);
+          const seed = (seedFromName(logicalPath) ^ wbResState.saltBytes[0]) & 0xff;
+          return xor(data, wbResState.keyBytes, seed);
+        };
+        const ensureHelper = async () => {
+          if (wbResState.helperInstalled) return;
+          await initWbRes();
+          if (!wbResState.meta) return;
+          wbResState.helperInstalled = true;
+          storage.addHelper({
+            load: async (assetType, assetId, dataFormat) => {
+              const key = assetId + '.' + dataFormat;
+              const plain = await loadPacked(key);
+              if (!plain) return null;
+              return storage.createAsset(assetType, dataFormat, plain, assetId);
+            }
+          });
+        };
+        return async () => {
+          await ensureHelper();
+          const plain = await loadPacked('project.json');
+          if (!plain) throw new Error('Missing packed project.json');
+          return plain.buffer.slice(plain.byteOffset, plain.byteOffset + plain.byteLength);
+        };` : `
         storage.addWebStore(
           [
             storage.AssetType.ImageVector,
@@ -2104,7 +2477,7 @@ cd "$(dirname "$0")"
           ].filter(i => i),
           (asset) => new URL('./assets/' + asset.assetId + '.' + asset.dataFormat, location).href
         );
-        return ${getProjectDataFunction};`}
+        return ${getProjectDataFunction};`)}
       })();
     </script>`);
 
@@ -2192,16 +2565,21 @@ cd "$(dirname "$0")"
     this.ensureNotAborted();
     await this.loadPlugins();
     await this.runPluginHook('beforePackage', null, {phase: 'beforePackage'});
+    const packResourcesXor = !!(this.options.wb && this.options.wb.packResourcesXor);
     const encryptProject = !!(this.options.wb && this.options.wb.encryptProject && this.options.target !== 'html');
     if (encryptProject) {
       if (!(crypto && crypto.subtle && crypto.subtle.importKey && crypto.subtle.encrypt)) {
         throw new Error('WebCrypto is not available');
       }
       const keyBytes = randomBytes(32);
-      const ivBytes = randomBytes(12);
+      const projectIvBytes = randomBytes(12);
       this.wbEncryption = {
+        v: 2,
+        alg: 'A256GCM',
         k: bytesToBase64(keyBytes),
-        iv: bytesToBase64(ivBytes)
+        project: {
+          iv: bytesToBase64(projectIvBytes)
+        }
       };
 
       if (this.project && this.project.type === 'sb3') {
@@ -2329,12 +2707,16 @@ cd "$(dirname "$0")"
       }
     }
     const useCleanTemplate = !!(this.options.wb && this.options.wb.cleanHtmlTemplate);
-    const html = useCleanTemplate ? encodeBigString`<!DOCTYPE html>
+    const useSecureCsp = !!(this.options.wb && (this.options.wb.secureCsp || ((this.options.wb.encryptProject || this.options.wb.protectElectron) && String(this.options.target || '').startsWith('electron-'))));
+    const csp = useSecureCsp
+      ? "default-src 'self' data: blob:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' blob:; connect-src 'self' https: http: ws: wss:; media-src 'self' data: blob:; worker-src 'self' blob:;"
+      : "default-src * 'self' 'unsafe-inline' 'unsafe-eval' data: blob:";
+    let html = useCleanTemplate ? encodeBigString`<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-  <meta http-equiv="Content-Security-Policy" content="default-src * 'self' 'unsafe-inline' 'unsafe-eval' data: blob:">
+  <meta http-equiv="Content-Security-Policy" content="${csp}">
   <title>${escapeXML(this.options.app.windowTitle)}</title>
   <style>
     :root { background: ${this.options.appearance.background}; color: ${this.options.appearance.foreground}; }
@@ -2449,6 +2831,94 @@ cd "$(dirname "$0")"
           return null;
         }
       };
+
+      const wbResPack = (() => {
+        let ready = false;
+        let initPromise = null;
+        let meta = null;
+        let keyBytes = null;
+        let saltBytes = null;
+
+        const b64ToBytes = (b64) => Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+        const seedFromName = (name) => {
+          let seed = 0;
+          for (let i = 0; i < name.length; i++) seed = (seed + name.charCodeAt(i)) & 0xff;
+          return seed;
+        };
+        const xor = (bytes, key, seed) => {
+          const out = new Uint8Array(bytes.length);
+          for (let i = 0; i < bytes.length; i++) {
+            out[i] = bytes[i] ^ key[(i + seed) % key.length] ^ seed;
+          }
+          return out;
+        };
+        const ensure = async () => {
+          if (ready) return;
+          if (initPromise) return initPromise;
+          initPromise = (async () => {
+            meta = window.__WB_RSP__ || null;
+            if (!meta) {
+              const ab = await tryRead('./wb-res/meta.json');
+              if (ab) {
+                try {
+                  const text = new TextDecoder().decode(new Uint8Array(ab));
+                  meta = JSON.parse(text);
+                } catch (e) {
+                  meta = null;
+                }
+              }
+            }
+            if (!meta || !meta.parts || !meta.order || !meta.salt || !meta.map) {
+              meta = null;
+              ready = true;
+              return;
+            }
+            saltBytes = b64ToBytes(meta.salt);
+            const partCount = meta.parts.length;
+            const shards = [];
+            for (let i = 0; i < partCount; i++) {
+              const physical = meta.order[i];
+              const shardObf = b64ToBytes(meta.parts[physical]);
+              shards.push(xor(shardObf, saltBytes, i & 0xff));
+            }
+            const total = shards.reduce((a, b) => a + b.length, 0);
+            const out = new Uint8Array(total);
+            let off = 0;
+            for (const s of shards) {
+              out.set(s, off);
+              off += s.length;
+            }
+            keyBytes = out;
+            ready = true;
+          })();
+          return initPromise;
+        };
+        const normalizeRequest = (p) => {
+          let s = String(p || '');
+          s = s.replace(/^[.][\\/]/, '');
+          s = s.replace(/^[/\\\\]+/, '');
+          if (s === 'assets/project.json') return 'project.json';
+          if (s.startsWith('assets/')) return s.slice('assets/'.length);
+          return s;
+        };
+        const loadPacked = async (path) => {
+          await ensure();
+          if (!meta || !keyBytes || !saltBytes) return null;
+          const key = normalizeRequest(path);
+          const packedPath = meta.map[key];
+          if (!packedPath) return null;
+          const ab = await tryRead('./' + packedPath);
+          if (!ab) return null;
+          const data = new Uint8Array(ab);
+          const seed = (seedFromName(key) ^ saltBytes[0]) & 0xff;
+          const plain = xor(data, keyBytes, seed);
+          return plain.buffer.slice(plain.byteOffset, plain.byteOffset + plain.byteLength);
+        };
+        return {
+          loadProject: () => loadPacked('./assets/project.json'),
+          loadAsset: (assetId, dataFormat) => loadPacked('./assets/' + assetId + '.' + dataFormat)
+        };
+      })();
 
       const concatBuffers = (buffers) => {
         let total = 0;
@@ -2631,6 +3101,18 @@ cd "$(dirname "$0")"
           return await loadProjectZip(zipBuffer);
         }
 
+        const packedProject = await wbResPack.loadProject();
+        if (packedProject) {
+          storage.addHelper({
+            load: async (assetType, assetId, dataFormat) => {
+              const ab = await wbResPack.loadAsset(assetId, dataFormat);
+              if (!ab) return null;
+              return storage.createAsset(assetType, dataFormat, new Uint8Array(ab), assetId);
+            }
+          });
+          return packedProject;
+        }
+
         storage.addWebStore(
           [
             storage.AssetType.ImageVector,
@@ -2666,7 +3148,7 @@ cd "$(dirname "$0")"
         launchScreen.focus();
       };
 
-      start().catch(handleError);
+      setTimeout(() => start().catch(handleError), 0);
     } catch (e) {
       handleError(e);
     }
@@ -2685,7 +3167,7 @@ cd "$(dirname "$0")"
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <!-- We only include this to explicitly loosen the CSP of various packager environments. It does not provide any security. -->
-  <meta http-equiv="Content-Security-Policy" content="default-src * 'self' 'unsafe-inline' 'unsafe-eval' data: blob:">
+  <meta http-equiv="Content-Security-Policy" content="${csp}">
   <title>${escapeXML(this.options.app.windowTitle)}</title>
   <style>
     body {
@@ -3191,7 +3673,8 @@ cd "$(dirname "$0")"
         zip = new (await getJSZip());
         if (encryptProject) {
           const keyBytes = Uint8Array.from(atob(this.wbEncryption.k), c => c.charCodeAt(0));
-          const ivBytes = Uint8Array.from(atob(this.wbEncryption.iv), c => c.charCodeAt(0));
+          const ivB64 = (this.wbEncryption && this.wbEncryption.v === 2 && this.wbEncryption.project && this.wbEncryption.project.iv) ? this.wbEncryption.project.iv : this.wbEncryption.iv;
+          const ivBytes = Uint8Array.from(atob(ivB64), c => c.charCodeAt(0));
           const ciphertext = await aesGcmEncrypt(this.project.arrayBuffer, keyBytes, ivBytes);
           const projectBin = new Uint8Array(ciphertext);
           if (shredWbResources) {
@@ -3220,6 +3703,43 @@ cd "$(dirname "$0")"
         }
       } else {
         zip.file('script.js', this.script);
+      }
+
+      if (packResourcesXor && !encryptProject) {
+        try {
+          const keyBytes = randomBytes(32);
+          const saltBytes = randomBytes(16);
+          const meta = buildXorResourcePackMeta(this.options.projectId, keyBytes, saltBytes);
+          const paths = Object.keys(zip.files || {}).filter((p) => {
+            const f = zip.files[p];
+            if (!f || f.dir) return false;
+            if (p === 'index.html') return false;
+            if (p.startsWith('wb-res/')) return false;
+            if (p.startsWith('assets/')) return true;
+            if (p === 'project.json' || p.endsWith('/project.json')) return true;
+            return false;
+          });
+          for (const originalPath of paths) {
+            const f = zip.file(originalPath);
+            if (!f) continue;
+            const key = normalizePackedResourceKey(originalPath);
+            const packedPath = `wb-res/${bytesToHex(randomBytes(8))}.wb`;
+            const plain = await f.async('uint8array');
+            const seed = (fileSeed(key) ^ saltBytes[0]) & 0xff;
+            const enc = xorCrypt(plain, keyBytes, seed);
+            meta.map[key] = packedPath;
+            zip.file(packedPath, enc);
+            zip.remove(originalPath);
+          }
+          zip.file('wb-res/meta.json', JSON.stringify(meta));
+          const indexFile = zip.file('index.html');
+          if (indexFile) {
+            const htmlBytes = await indexFile.async('uint8array');
+            zip.file('index.html', injectWbResMetaIntoHtml(htmlBytes, meta));
+          }
+        } catch (e) {
+          console.warn(e);
+        }
       }
 
       if (this.options.target.startsWith('nwjs-')) {
@@ -3342,6 +3862,7 @@ Packager.DEFAULT_OPTIONS = () => ({
   target: 'html',
   app: {
     icon: null,
+    writeWindowsExeIcon: true,
     packageName: Packager.getDefaultPackageNameFromFileName(''),
     windowTitle: Packager.getWindowTitleFromFileName(''),
     windowMode: 'window',
@@ -3392,8 +3913,26 @@ Packager.DEFAULT_OPTIONS = () => ({
     obfuscateUnpack: true,
     disableDevtools: true,
     verifyScriptHash: true,
-    verifyIndexHash: true
+    verifyIndexHash: true,
+    secureCsp: false,
+    packResourcesXor: false,
+    integrity: {
+      enabled: false,
+      required: false,
+      kid: '',
+      publicKeys: {},
+      manifestName: 'wb-integrity.json',
+      signatureName: 'wb-integrity.sig'
+    }
   }
 });
+
+Packager._test = {
+  buildXorResourcePackMeta,
+  normalizePackedResourceKey,
+  injectWbResMetaIntoHtml,
+  xorCrypt,
+  fileSeed
+};
 
 export default Packager;

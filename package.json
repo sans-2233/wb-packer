@@ -33,6 +33,7 @@
   "license": "MPL-2.0",
   "dependencies": {
     "@fiahfy/icns": "^0.0.7",
+    "@shockpkg/resedit": "^2.0.2",
     "@turbowarp/json": "^0.1.1",
     "@turbowarp/jszip": "^3.11.0",
     "@turbowarp/sbdl": "^7.0.0",
