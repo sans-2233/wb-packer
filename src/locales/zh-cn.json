@@ -71,6 +71,8 @@
         "highQualityPen": "高清画笔",
         "html": "HTML 文件（单个文件，在大部分现代浏览器上可用）",
         "icon": "窗口图标",
+        "writeWindowsExeIcon": "Windows：同时写入生成的 .exe 图标",
+        "writeWindowsExeIconHelp": "这会影响资源管理器/任务栏显示的可执行文件图标，而不只是窗口图标。",
         "implicitCloudHint": "提示：任何名称以“{cloud}”开头的变量都将被转换为云变量，无论它们创建时是否是云变量。",
         "import": "导入设置",
         "infiniteClones": "无限克隆",
