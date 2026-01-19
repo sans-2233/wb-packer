@@ -270,6 +270,24 @@
     "writeWindowsExeIconHelp": {
       "string": "This affects the Windows executable's icon shown in Explorer/taskbar, not just the window icon."
     },
+    "exportWindowsIco": {
+      "string": "Windows: also export icon.ico"
+    },
+    "exportWindowsIcoHelp": {
+      "string": "Creates icon.ico from the selected icon image and places it inside the exported app. Useful for installers and shortcuts."
+    },
+    "writeMacElectronIcns": {
+      "string": "macOS: also apply icon to the .app bundle"
+    },
+    "writeMacElectronIcnsHelp": {
+      "string": "Replaces the default Electron app icon (electron.icns) with the selected icon."
+    },
+    "exportLinuxDesktopFile": {
+      "string": "Linux: also generate a desktop entry"
+    },
+    "exportLinuxDesktopFileHelp": {
+      "string": "Adds a .desktop file and an install script so you can register the app icon in your desktop environment."
+    },
     "controls": {
       "string": "Controls",
       "developer_comment": "Controls section header"

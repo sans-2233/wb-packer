@@ -63,6 +63,8 @@
   let showPlugins = false;
   let pluginDir = '';
   let pluginEntries = [];
+  let pluginDebug = [];
+  let lastPackagerInfo = null;
   const resetResult = () => {
     previewer = null;
     if (result) {
@@ -169,6 +171,9 @@
     packager.addEventListener('zip-progress', ({detail}) => {
       task.setProgressText($_('progress.compressingProject'));
       task.setProgress(detail.progress);
+    });
+    packager.addEventListener('wb-packager-info', ({detail}) => {
+      lastPackagerInfo = detail;
     });
 
     const result = await packager.package();
@@ -281,18 +286,95 @@
   });
 
   const loadPlugins = async () => {
-    const api = (typeof window !== 'undefined') ? window.PackagerPluginsPreload : null;
+    pluginDebug = [];
+    const addDebug = (...args) => {
+      const line = args.map((i) => {
+        try {
+          if (typeof i === 'string') return i;
+          return JSON.stringify(i);
+        } catch (e) {
+          try { return String(i); } catch (e2) { return '[unserializable]'; }
+        }
+      }).join(' ');
+      pluginDebug = [...pluginDebug, line];
+      try { console.log('[plugins]', line); } catch (e) {}
+      try {
+        const logger = (typeof window !== 'undefined') ? (window.EditorPreload && window.EditorPreload.wbLog) : null;
+        if (typeof logger === 'function') logger('info', line, {scope: 'plugins'});
+      } catch (e) {}
+    };
+    addDebug('loadPlugins start', {IsDesktop: typeof window !== 'undefined' && !!window.IsDesktop});
+    let api = (typeof window !== 'undefined') ? window.PackagerPluginsPreload : null;
+    addDebug('PackagerPluginsPreload exists', !!api);
+    if (!api) {
+      try {
+        const inNode = typeof process === 'object' && process && process.versions && !!process.versions.node;
+        const nodeRequire = (typeof __non_webpack_require__ === 'function') ? __non_webpack_require__ : (typeof require === 'function' ? require : null);
+        addDebug('node environment', {inNode, hasNodeRequire: typeof nodeRequire === 'function'});
+        if (inNode && typeof nodeRequire === 'function') {
+          const fs = nodeRequire('fs');
+          const path = nodeRequire('path');
+          const dirName = ($options && $options.wb && $options.wb.pluginDir) ? $options.wb.pluginDir : 'plugins';
+          const dirPath = path.resolve(process.cwd(), dirName);
+          addDebug('resolved dir', {dirName, dirPath});
+          api = {
+            dir: dirPath,
+            getDir: () => Promise.resolve(dirPath),
+            list: () => Promise.resolve((() => {
+              let entries;
+              try {
+                entries = fs.readdirSync(dirPath, {withFileTypes: true});
+              } catch (e) {
+                addDebug('readdirSync failed', String(e && (e.stack || e)));
+                return [];
+              }
+              const out = [];
+              for (const entry of entries) {
+                if (!entry || !entry.isFile()) continue;
+                const name = entry.name;
+                if (!name || name.startsWith('.')) continue;
+                if (!name.endsWith('.js') && !name.endsWith('.cjs')) continue;
+                let size = 0;
+                try {
+                  size = fs.statSync(path.join(dirPath, name)).size;
+                } catch (e) {}
+                out.push({name, size});
+              }
+              addDebug('plugins found', out.map((i) => i.name));
+              return out;
+            })()),
+            read: (name) => Promise.resolve(fs.readFileSync(path.join(dirPath, String(name)), 'utf8'))
+          };
+          window.PackagerPluginsPreload = api;
+          addDebug('fallback preload installed', true);
+        }
+      } catch (e) {
+        addDebug('fallback error', String(e && (e.stack || e)));
+      }
+    }
     if (!api || typeof api.list !== 'function') {
       pluginDir = '';
       pluginEntries = [];
+      addDebug('no api.list -> unsupported');
       return;
     }
     if (typeof api.getDir === 'function') {
-      pluginDir = await api.getDir();
+      try {
+        pluginDir = await api.getDir();
+      } catch (e) {
+        pluginDir = '';
+        addDebug('getDir failed', String(e && (e.stack || e)));
+      }
     } else {
       pluginDir = api.dir || '';
     }
-    pluginEntries = await api.list();
+    try {
+      pluginEntries = await api.list();
+      addDebug('list ok', {count: pluginEntries.length});
+    } catch (e) {
+      pluginEntries = [];
+      addDebug('list failed', String(e && (e.stack || e)));
+    }
   };
 
   const openPlugins = async () => {
@@ -509,6 +591,9 @@
     resetOptions([
       'app.windowTitle',
       'app.writeWindowsExeIcon',
+      'app.exportWindowsIco',
+      'app.writeMacElectronIcns',
+      'app.exportLinuxDesktopFile',
       'loadingScreen',
       'autoplay',
       'controls',
@@ -534,6 +619,25 @@
         {$_('options.writeWindowsExeIcon')}
       </label>
       <p>{$_('options.writeWindowsExeIconHelp')}</p>
+      <label class="option">
+        <input type="checkbox" bind:checked={$options.app.exportWindowsIco}>
+        {$_('options.exportWindowsIco')}
+      </label>
+      <p>{$_('options.exportWindowsIcoHelp')}</p>
+    {/if}
+    {#if $options.target.startsWith('electron-mac')}
+      <label class="option">
+        <input type="checkbox" bind:checked={$options.app.writeMacElectronIcns}>
+        {$_('options.writeMacElectronIcns')}
+      </label>
+      <p>{$_('options.writeMacElectronIcnsHelp')}</p>
+    {/if}
+    {#if $options.target.startsWith('electron-linux')}
+      <label class="option">
+        <input type="checkbox" bind:checked={$options.app.exportLinuxDesktopFile}>
+        {$_('options.exportLinuxDesktopFile')}
+      </label>
+      <p>{$_('options.exportLinuxDesktopFileHelp')}</p>
     {/if}
 
     <h3>{$_('options.loadingScreen')}</h3>
@@ -856,6 +960,41 @@
         <input type="checkbox" bind:checked={$options.wb.packResourcesXor} />
         资源封包(实现很简单!不要指望能当作加密来用 只能防止直接提取)
       </label>
+      <label class="option">
+        <input type="checkbox" bind:checked={$options.wb.debugLog} />
+        输出运行时/资源加载诊断日志
+      </label>
+      {#if $options.wb.debugLog}
+        <label class="option">
+          <input type="checkbox" bind:checked={$options.wb.debugLogVerbose} />
+          详细日志（会输出更多路径与读文件结果）
+        </label>
+      {/if}
+      <label class="option">
+        扩展加载策略（secure CSP 下建议使用“文件”）
+        <select bind:value={$options.wb.extensionLoadStrategy}>
+          <option value="auto">自动</option>
+          <option value="file">文件</option>
+          <option value="data">data URL</option>
+        </select>
+      </label>
+      {#if lastPackagerInfo}
+        <details class="group">
+          <summary>最近一次导出摘要</summary>
+          <div class="mono">
+            target: {lastPackagerInfo.target}{'\n'}
+            buildId: {lastPackagerInfo.buildId}{'\n'}
+            packageName: {lastPackagerInfo.packageName}{'\n'}
+            macos.icnsWritten: {lastPackagerInfo.macos && lastPackagerInfo.macos.icnsWritten}{'\n'}
+            linux.desktopWritten: {lastPackagerInfo.linux && lastPackagerInfo.linux.desktopWritten}{'\n'}
+            embeddedExtensions.files: {lastPackagerInfo.embeddedExtensions && lastPackagerInfo.embeddedExtensions.files}{'\n'}
+            {'\n'}
+            {#each (lastPackagerInfo.logLines || []) as line}
+              {line}{'\n'}
+            {/each}
+          </div>
+        </details>
+      {/if}
       <div class="group">
         <Button on:click={openPlugins} secondary text="插件系统" />
       </div>
@@ -871,6 +1010,16 @@
         <p class="mono">{pluginDir}</p>
       {:else}
         <p>当前环境不支持自动读取 plugins 目录。</p>
+      {/if}
+      {#if pluginDebug.length > 0}
+        <details class="group">
+          <summary>诊断日志</summary>
+          <div class="mono">
+            {#each pluginDebug as line}
+              {line}{'\n'}
+            {/each}
+          </div>
+        </details>
       {/if}
       {#if pluginEntries.length > 0}
         <div class="mono">
