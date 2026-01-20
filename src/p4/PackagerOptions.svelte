@@ -1006,6 +1006,11 @@
   <div class="modal-backdrop" in:fade|local on:click={() => showPlugins = false}>
     <div class="modal" on:click|stopPropagation>
       <h2>插件系统</h2>
+      <label class="option">
+        <input type="checkbox" bind:checked={$options.wb.enablePluginDir} />
+        启用 plugins 目录（导出时生效）
+      </label>
+      <p class="mono">示例插件：plugins-available/legal-notice-and-integrity.cjs</p>
       {#if pluginDir}
         <p class="mono">{pluginDir}</p>
       {:else}
