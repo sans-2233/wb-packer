@@ -16,7 +16,6 @@ import {Adapter} from './adapter';
 import encodeBigString from './encode-big-string';
 import {loadPluginsFromDir, loadPluginsFromDesktopPreload, runHookChain} from './plugin-system';
 import {patchWindowsExecutableIcon} from './windows/patch-exe-icon';
-import {pngToIco} from './windows/png-to-ico';
 
 const PROGRESS_LOADED_SCRIPTS = 0.1;
 
@@ -48,38 +47,6 @@ const sha256HexOfBytes = (bytes) => {
   const hash = new SHA256();
   hash.update(bytes);
   return hash.digest('hex');
-};
-
-const stableIntegrityManifestString = (manifest) => {
-  const files = manifest && manifest.files && typeof manifest.files === 'object' ? manifest.files : {};
-  const sortedFiles = {};
-  for (const k of Object.keys(files).sort()) {
-    sortedFiles[k] = files[k];
-  }
-  const normalized = {
-    v: 1,
-    kid: String(manifest && manifest.kid ? manifest.kid : ''),
-    files: sortedFiles
-  };
-  return JSON.stringify(normalized);
-};
-
-const buildIntegrityManifestForPrefix = async (zip, resourcesPrefix, excludeRel) => {
-  const files = {};
-  const exclude = excludeRel && typeof excludeRel.has === 'function' ? excludeRel : null;
-  for (const fullPath of Object.keys(zip.files || {})) {
-    if (!fullPath.startsWith(resourcesPrefix)) continue;
-    if (zip.files[fullPath] && zip.files[fullPath].dir) continue;
-    const rel = fullPath.slice(resourcesPrefix.length);
-    if (!rel || rel.endsWith('/')) continue;
-    if (exclude && exclude.has(rel)) continue;
-    const data = await zip.file(fullPath).async('uint8array');
-    files[rel] = {
-      sha256: sha256HexOfBytes(data),
-      size: data.length
-    };
-  }
-  return {v: 1, kid: '', files};
 };
 
 const stableObfuscatedName = (prefix, id) => `${prefix}${sha256HexOfString(id).substring(0, 10)}`;
@@ -153,14 +120,6 @@ const xorCrypt = (bytes, keyBytes, seed) => {
   return out;
 };
 
-const normalizePackedResourceKey = (zipPath) => {
-  if (zipPath === 'project.json' || zipPath.endsWith('/project.json')) return 'project.json';
-  if (zipPath.startsWith('assets/')) return zipPath.slice('assets/'.length);
-  const slash = zipPath.lastIndexOf('/');
-  if (slash !== -1) return zipPath.slice(slash + 1);
-  return zipPath;
-};
-
 const bytesToBase64 = (bytes) => {
   let binary = '';
   const chunkSize = 0x8000;
@@ -232,38 +191,6 @@ const splitIntoShards = (bytes, count) => {
     off += size;
   }
   return shards;
-};
-
-const buildXorResourcePackMeta = (projectId, keyBytes, saltBytes, partCount = 8) => {
-  const shards = splitIntoShards(keyBytes, partCount);
-  const seed = shardSeed(keyBytes, saltBytes, `wb-res:${String(projectId || '')}`);
-  const order = shuffledIndices(partCount, seed);
-  const parts = Array(partCount);
-  for (let i = 0; i < partCount; i++) {
-    const physical = order[i];
-    const obf = xorCrypt(shards[i], saltBytes, i & 0xff);
-    parts[physical] = bytesToBase64(obf);
-  }
-  return {
-    v: 1,
-    salt: bytesToBase64(saltBytes),
-    order,
-    parts,
-    map: {}
-  };
-};
-
-const injectWbResMetaIntoHtml = (htmlBytes, meta, nonce) => {
-  try {
-    const text = new TextDecoder().decode(htmlBytes);
-    if (text.includes('window.__WB_RSP__')) return htmlBytes;
-    const nonceAttr = (typeof nonce === 'string' && nonce) ? ` nonce="${nonce}"` : '';
-    const injected = text.replace('</body>', `<script${nonceAttr}>window.__WB_RSP__=${JSON.stringify(meta)};</script></body>`);
-    if (injected === text) return htmlBytes;
-    return new TextEncoder().encode(injected);
-  } catch (e) {
-    return htmlBytes;
-  }
 };
 
 const splitString = (string, count) => {
@@ -911,101 +838,16 @@ cd "$(dirname "$0")"
 
     const icon = await Adapter.getAppIcon(this.options.app.icon);
     zip.file(`${resourcesPrefix}${iconName}`, icon);
-    const packagerInfo = {
-      buildId: buildId || null,
-      target: this.options.target,
-      packageName,
-      version: this.options.app && this.options.app.version,
-      logLines: [],
-      wb: {
-        protectElectron: !!(this.options.wb && this.options.wb.protectElectron),
-        encryptProject: !!(this.options.wb && this.options.wb.encryptProject),
-        encryptRuntime: !!(this.options.wb && this.options.wb.encryptRuntime),
-        opcodeObfuscation: !!(this.options.wb && this.options.wb.opcodeObfuscation),
-        shredWbResources: !!(this.options.wb && this.options.wb.shredWbResources),
-        splitElectronEntry: !!(this.options.wb && this.options.wb.splitElectronEntry),
-        secureCsp: !!(this.options.wb && this.options.wb.secureCsp),
-        extensionLoadStrategy: (this.options.wb && this.options.wb.extensionLoadStrategy) || 'auto',
-        debugLog: !!(this.options.wb && this.options.wb.debugLog),
-        debugLogVerbose: !!(this.options.wb && this.options.wb.debugLogVerbose)
-      },
-      embeddedExtensions: {
-        files: this._embeddedExtensionFiles ? Object.keys(this._embeddedExtensionFiles).length : 0
-      },
-      windows: {
-        writeWindowsExeIcon: !!(this.options.app && this.options.app.writeWindowsExeIcon !== false),
-        exportWindowsIco: !!(this.options.app && this.options.app.exportWindowsIco),
-        exeIconPatched: null,
-        exeIconError: null,
-        exportedIco: null,
-        exportedIcoError: null
-      },
-      macos: {
-        writeMacElectronIcns: !!(this.options.app && this.options.app.writeMacElectronIcns !== false),
-        icnsWritten: null,
-        icnsError: null
-      },
-      linux: {
-        exportDesktopFile: !!(this.options.app && this.options.app.exportLinuxDesktopFile),
-        desktopWritten: null,
-        desktopError: null
-      }
-    };
-    const wbPackagerLog = (message, data) => {
-      const m = String(message || '');
-      const payload = (typeof data === 'undefined') ? '' : (() => {
-        try { return JSON.stringify(data); } catch (e) { return String(data); }
-      })();
-      const line = payload ? `${m} ${payload}` : m;
-      try { packagerInfo.logLines.push(line); } catch (e) {}
-      try { console.log('[packager]', line); } catch (e) {}
-    };
-    wbPackagerLog('build', {buildId: packagerInfo.buildId, target: packagerInfo.target, packageName: packagerInfo.packageName, version: packagerInfo.version});
-    wbPackagerLog('wb options', packagerInfo.wb);
-    wbPackagerLog('embedded extensions', packagerInfo.embeddedExtensions);
-    if (isWindows && this.options.app.exportWindowsIco) {
-      try {
-        const ico = await pngToIco(icon);
-        zip.file(`${resourcesPrefix}icon.ico`, ico);
-        packagerInfo.windows.exportedIco = true;
-        wbPackagerLog('windows icon.ico exported');
-      } catch (e) {
-        console.warn(e);
-        packagerInfo.windows.exportedIco = false;
-        packagerInfo.windows.exportedIcoError = String(e && (e.stack || e));
-        wbPackagerLog('windows icon.ico export failed', {error: packagerInfo.windows.exportedIcoError});
-      }
-    }
     if (isWindows && this.options.app.writeWindowsExeIcon !== false) {
       try {
         const exePath = `${rootPrefix}${packageName}.exe`;
         const exe = await zip.file(exePath).async('arraybuffer');
         const patchedExe = await patchWindowsExecutableIcon(exe, icon);
         zip.file(exePath, patchedExe);
-        packagerInfo.windows.exeIconPatched = true;
-        wbPackagerLog('windows exe icon patched', {exePath});
       } catch (e) {
         console.warn(e);
-        packagerInfo.windows.exeIconPatched = false;
-        packagerInfo.windows.exeIconError = String(e && (e.stack || e));
-        wbPackagerLog('windows exe icon patch failed', {error: packagerInfo.windows.exeIconError});
       }
     }
-    const writePackagerInfo = () => {
-      try {
-        zip.file(`${resourcesPrefix}wb-packager-info.json`, JSON.stringify(packagerInfo, null, 2));
-        try {
-          const text = packagerInfo.logLines.join('\n') + '\n';
-          zip.file(`${resourcesPrefix}wb-packager.log`, text);
-        } catch (e) {}
-        try {
-          this.dispatchEvent(new CustomEvent('wb-packager-info', {detail: packagerInfo}));
-        } catch (e) {}
-        wbPackagerLog('wb-packager-info.json written');
-      } catch (e) {
-        console.warn('[packager]', 'failed to write wb-packager-info.json');
-      }
-    };
 
     const manifest = {
       name: packageName,
@@ -1019,49 +861,8 @@ cd "$(dirname "$0")"
     const wbDisableDevtools = wbProtectElectron || !(this.options.wb && this.options.wb.disableDevtools === false);
     const wbVerifyScriptHash = !(this.options.wb && this.options.wb.verifyScriptHash === false);
     const wbVerifyIndexHash = !(this.options.wb && this.options.wb.verifyIndexHash === false);
-    const wbIntegrity = (this.options.wb && this.options.wb.integrity && typeof this.options.wb.integrity === 'object')
-      ? this.options.wb.integrity
-      : null;
-    const wbIntegrityEnabled = !!(wbIntegrity && wbIntegrity.enabled);
-    const wbIntegrityRequired = !!(wbIntegrity && wbIntegrity.required);
-    const wbIntegrityManifestName = (wbIntegrity && typeof wbIntegrity.manifestName === 'string' && wbIntegrity.manifestName) ? wbIntegrity.manifestName : 'wb-integrity.json';
-    const wbIntegritySignatureName = (wbIntegrity && typeof wbIntegrity.signatureName === 'string' && wbIntegrity.signatureName) ? wbIntegrity.signatureName : 'wb-integrity.sig';
-    let wbIntegrityPublicKeys = (wbIntegrity && wbIntegrity.publicKeys && typeof wbIntegrity.publicKeys === 'object') ? wbIntegrity.publicKeys : {};
-    let wbIntegrityKid = (wbIntegrity && typeof wbIntegrity.kid === 'string') ? wbIntegrity.kid : '';
-
     const indexHTML = projectZip.file('index.html') ? await projectZip.file('index.html').async('string') : '';
     const expectedIndexHash = wbVerifyIndexHash ? sha256HexOfString(indexHTML) : null;
-
-    if (wbIntegrityEnabled) {
-      try {
-        const exclude = new Set([wbIntegrityManifestName, wbIntegritySignatureName]);
-        const integrityManifest = await buildIntegrityManifestForPrefix(zip, resourcesPrefix, exclude);
-        if (wbIntegrityKid) integrityManifest.kid = wbIntegrityKid;
-        const integrityManifestText = stableIntegrityManifestString(integrityManifest);
-        const signResult = await this.runPluginHook('signIntegrityManifest', {
-          manifestText: integrityManifestText,
-          manifest: integrityManifest,
-          publicKeys: wbIntegrityPublicKeys
-        }, {phase: 'signIntegrityManifest'});
-        const resultObj = signResult && typeof signResult === 'object' ? signResult : null;
-        if (resultObj) {
-          if (typeof resultObj.kid === 'string' && resultObj.kid) {
-            wbIntegrityKid = resultObj.kid;
-            integrityManifest.kid = wbIntegrityKid;
-          }
-          if (resultObj.publicKeys && typeof resultObj.publicKeys === 'object') {
-            wbIntegrityPublicKeys = resultObj.publicKeys;
-          }
-        }
-        const finalManifestText = stableIntegrityManifestString(integrityManifest);
-        zip.file(resourcesPrefix + wbIntegrityManifestName, finalManifestText);
-        if (resultObj && resultObj.signature) {
-          zip.file(resourcesPrefix + wbIntegritySignatureName, resultObj.signature);
-        }
-      } catch (e) {
-        console.warn(e);
-      }
-    }
 
     let mainJS = `'use strict';
 const {app, BrowserWindow, Menu, shell, screen, dialog, ipcMain} = require('electron');
@@ -1095,50 +896,8 @@ const defaultProjectURL = new URL('./index.html', resourcesURL).href;
 ${wbVerifyScriptHash ? `const expectedScriptHash = ${JSON.stringify(this.wbAppIntegrity ? this.wbAppIntegrity.sha256 : sha256HexOfString(this.script))};` : ''}
 ${wbVerifyIndexHash ? `const expectedIndexHash = ${JSON.stringify(expectedIndexHash)};` : ''}
 const wbIntegrityFile = ${JSON.stringify(this.wbAppIntegrity ? this.wbAppIntegrity.file : 'script.js')};
-const WB_INTEGRITY_REQUIRED = ${JSON.stringify(wbIntegrityRequired)};
-const WB_INTEGRITY_MANIFEST = ${JSON.stringify(wbIntegrityManifestName)};
-const WB_INTEGRITY_SIGNATURE = ${JSON.stringify(wbIntegritySignatureName)};
-const WB_INTEGRITY_KEYS = ${JSON.stringify(wbIntegrityPublicKeys || {})};
-
-const verifySignedIntegrityManifest = () => {
-  try {
-    const manifestPath = path.join(__dirname, WB_INTEGRITY_MANIFEST);
-    const sigPath = path.join(__dirname, WB_INTEGRITY_SIGNATURE);
-    if (!fs.existsSync(manifestPath) || !fs.existsSync(sigPath)) {
-      return !WB_INTEGRITY_REQUIRED;
-    }
-    const manifestBytes = fs.readFileSync(manifestPath);
-    const signature = fs.readFileSync(sigPath);
-    const manifest = JSON.parse(manifestBytes.toString('utf8'));
-    const kid = manifest && typeof manifest.kid === 'string' ? manifest.kid : '';
-    const pub = WB_INTEGRITY_KEYS[kid];
-    if (!pub) return false;
-    const ok = crypto.verify('sha256', manifestBytes, pub, signature);
-    if (!ok) return false;
-    const files = manifest && manifest.files && typeof manifest.files === 'object' ? manifest.files : null;
-    if (!files) return false;
-    for (const rel of Object.keys(files)) {
-      if (typeof rel !== 'string' || !rel) return false;
-      const expected = files[rel] && typeof files[rel].sha256 === 'string' ? files[rel].sha256 : '';
-      if (!expected) return false;
-      const abs = path.join(__dirname, rel);
-      const normalized = path.normalize(abs);
-      if (!normalized.startsWith(path.normalize(__dirname + path.sep))) return false;
-      const data = fs.readFileSync(abs);
-      const actual = crypto.createHash('sha256').update(data).digest('hex');
-      if (actual !== expected) return false;
-    }
-    return true;
-  } catch (e) {
-    return false;
-  }
-};
 
 const verifyIntegrity = () => {
-  if (!verifySignedIntegrityManifest()) {
-    app.exit(2);
-    return false;
-  }
   if (!${JSON.stringify(wbVerifyScriptHash)} && !${JSON.stringify(wbVerifyIndexHash)}) return true;
   try {
     if (${JSON.stringify(wbVerifyScriptHash)}) {
@@ -1637,37 +1396,7 @@ ipcMain.handle('overlay-destroy', async (event, {id}) => {
 ipcMain.handle('wb-read-file', async (event, {path: relativePath}) => {
   const rel = typeof relativePath === 'string' ? relativePath : '';
   const safe = rel.replace(/^\.?[\\/]+/, '');
-  const candidates = [];
-  try {
-    if (typeof process === 'object' && process) {
-      if (typeof process.resourcesPath === 'string' && process.resourcesPath) {
-        candidates.push(path.join(process.resourcesPath, 'app'));
-        candidates.push(path.join(process.resourcesPath, 'app.asar'));
-        candidates.push(path.join(process.resourcesPath, 'app.asar.unpacked'));
-      }
-      if (typeof process.execPath === 'string' && process.execPath) {
-        candidates.push(path.dirname(process.execPath));
-      }
-      if (typeof process.cwd === 'function') {
-        candidates.push(process.cwd());
-      }
-    }
-  } catch (e) {}
-  candidates.push(__dirname);
-  let resolved = null;
-  for (const base of candidates) {
-    try {
-      if (!base) continue;
-      const attempt = path.join(base, safe);
-      if (fs.existsSync(attempt)) {
-        resolved = attempt;
-        break;
-      }
-    } catch (e) {}
-  }
-  if (!resolved) {
-    resolved = path.join(__dirname, safe);
-  }
+  const resolved = path.join(__dirname, safe);
   const data = fs.readFileSync(resolved);
   return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
 });
@@ -1786,10 +1515,6 @@ ipcMain.handle('wb-open-devtools', async (event) => {
       }
     }
 
-    mainJS = await this.runPluginHook('transformElectronMain', mainJS, {phase: 'transformElectronMain'});
-    preloadJS = await this.runPluginHook('transformElectronPreload', preloadJS, {phase: 'transformElectronPreload'});
-    overlayPreloadJS = await this.runPluginHook('transformElectronOverlayPreload', overlayPreloadJS, {phase: 'transformElectronOverlayPreload'});
-
     if (wbProtectElectron) {
       const obf = (code) => JavaScriptObfuscator.obfuscate(code, {
         compact: true,
@@ -1870,21 +1595,8 @@ ipcMain.handle('wb-open-devtools', async (event) => {
         });
       }
 
-      if (this.options.app.writeMacElectronIcns !== false) {
-        try {
-          const icns = await pngToAppleICNS(icon);
-          zip.file(`${contentsPrefix}Resources/electron.icns`, icns);
-          packagerInfo.macos.icnsWritten = true;
-          wbPackagerLog('macos electron.icns written');
-        } catch (e) {
-          packagerInfo.macos.icnsWritten = false;
-          packagerInfo.macos.icnsError = String(e && (e.stack || e));
-          wbPackagerLog('macos electron.icns write failed', {error: packagerInfo.macos.icnsError});
-        }
-      } else {
-        packagerInfo.macos.icnsWritten = null;
-        wbPackagerLog('macos electron.icns skipped');
-      }
+      const icns = await pngToAppleICNS(icon);
+      zip.file(`${contentsPrefix}Resources/electron.icns`, icns);
     } else if (isLinux) {
       // Some Linux distributions can't easily open the executable file from the GUI, so we'll add a simple wrapper that people can use instead.
       const startScript = `#!/bin/bash
@@ -1893,48 +1605,8 @@ cd "$(dirname "$0")"
       zip.file(`${rootPrefix}start.sh`, startScript, {
         unixPermissions: 0o100755
       });
-      if (this.options.app.exportLinuxDesktopFile) {
-        try {
-          const desktopName = `${packageName}.desktop`;
-          const iconInstallPath = `${packageName}/icons/hicolor/512x512/apps/${packageName}.png`;
-          zip.file(iconInstallPath, icon);
-          const desktop = [
-            '[Desktop Entry]',
-            'Type=Application',
-            `Name=${this.options.app.windowTitle || packageName}`,
-            `Exec=sh -c 'cd \"$(dirname \"%k\")\"; ./start.sh'`,
-            `Icon=${packageName}`,
-            'Terminal=false',
-            'Categories=Game;'
-          ].join('\n') + '\n';
-          zip.file(`${packageName}/${desktopName}`, desktop);
-          const installScript = `#!/bin/bash
-set -e
-DIR="$(cd "$(dirname "$0")" && pwd)"
-APP="${packageName}"
-mkdir -p "$HOME/.local/share/applications"
-mkdir -p "$HOME/.local/share/icons/hicolor/512x512/apps"
-cp "$DIR/${desktopName}" "$HOME/.local/share/applications/${packageName}.desktop"
-cp "$DIR/icons/hicolor/512x512/apps/${packageName}.png" "$HOME/.local/share/icons/hicolor/512x512/apps/${packageName}.png"
-update-desktop-database "$HOME/.local/share/applications" >/dev/null 2>&1 || true
-gtk-update-icon-cache -q "$HOME/.local/share/icons/hicolor" >/dev/null 2>&1 || true
-echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.desktop"
-`;
-          zip.file(`${packageName}/install-desktop.sh`, installScript, {unixPermissions: 0o100755});
-          packagerInfo.linux.desktopWritten = true;
-          wbPackagerLog('linux desktop entry written', {desktop: `${packageName}/${desktopName}`, icon: iconInstallPath});
-        } catch (e) {
-          packagerInfo.linux.desktopWritten = false;
-          packagerInfo.linux.desktopError = String(e && (e.stack || e));
-          wbPackagerLog('linux desktop entry write failed', {error: packagerInfo.linux.desktopError});
-        }
-      } else {
-        packagerInfo.linux.desktopWritten = null;
-        wbPackagerLog('linux desktop entry skipped');
-      }
     }
 
-    writePackagerInfo();
     return zip;
   }
 
@@ -2045,18 +1717,16 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
     let storageProgressEnd;
 
     const encryptProject = !!(this.options.wb && this.options.wb.encryptProject && this.options.target !== 'html');
-    const packResourcesXor = !!(this.options.wb && this.options.wb.packResourcesXor);
     const shredWbResources = !!(encryptProject && this.options.wb && this.options.wb.shredWbResources);
     const obfuscateUnpack = !!(this.options.wb && this.options.wb.obfuscateUnpack);
-    const nonceAttr = (this.options.wb && this.options.wb.secureCsp && this._wbCspNonce) ? ` nonce="${this._wbCspNonce}"` : '';
     let wbUnpackHelpers = '';
     if (encryptProject) {
       const enc = this.wbEncryption;
-      if (!enc || !enc.k || (!enc.iv && !(enc.v === 2 && enc.project && enc.project.iv))) {
+      if (!enc || !enc.k || !enc.iv) {
         throw new Error('Missing encryption metadata');
       }
       result.push(`
-      <script${nonceAttr}>
+      <script>
         window.__WB_ENC__ = ${JSON.stringify(Object.assign({}, enc, shredWbResources ? {shred: {parts: 32}} : null))};
       </script>`);
 
@@ -2157,21 +1827,11 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
       storageProgressStart = PROGRESS_FETCHED_COMPRESSED;
       storageProgressEnd = PROGRESS_EXTRACTED_COMPRESSED;
 
-      const originalProjectData = new Uint8Array(this.project.arrayBuffer);
-      let projectData = originalProjectData;
-      if (packResourcesXor && isZip) {
-        const keyBytes = randomBytes(32);
-        const saltBytes = randomBytes(16);
-        const meta = buildXorResourcePackMeta(this.options.projectId, keyBytes, saltBytes, 8);
-        const seed = (fileSeed('project') ^ saltBytes[0]) & 0xff;
-        meta.seed = seed;
-        projectData = xorCrypt(originalProjectData, keyBytes, seed);
-        result.push(`<script${nonceAttr}>window.__WB_PX__=${JSON.stringify(meta)};</script>`);
-      }
+      const projectData = new Uint8Array(this.project.arrayBuffer);
 
       // keep this up-to-date with base85.js
       result.push(`
-      <script${nonceAttr}>
+      <script>
       const getBase85DecodeValue = (code) => {
         if (code === 0x28) code = 0x3c;
         if (code === 0x29) code = 0x3e;
@@ -2216,37 +1876,7 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
       getProjectDataFunction = `() => {
         const buffer = projectDecodeBuffer;
         projectDecodeBuffer = null; // Allow GC
-        let out = new Uint8Array(buffer, 0, ${projectData.length});
-        try {
-          const px = window.__WB_PX__;
-          if (px && px.parts && px.order && px.salt && Number.isFinite(px.seed)) {
-            const b64ToBytes = (b64) => Uint8Array.from(atob(b64), c => c.charCodeAt(0));
-            const saltBytes = b64ToBytes(px.salt);
-            const xor = (bytes, keyBytes, seed) => {
-              const o = new Uint8Array(bytes.length);
-              for (let i = 0; i < bytes.length; i++) {
-                o[i] = bytes[i] ^ keyBytes[(i + seed) % keyBytes.length] ^ seed;
-              }
-              return o;
-            };
-            const partCount = px.parts.length;
-            const shards = [];
-            for (let i = 0; i < partCount; i++) {
-              const physical = px.order[i];
-              const obf = b64ToBytes(px.parts[physical]);
-              shards.push(xor(obf, saltBytes, i & 0xff));
-            }
-            const total = shards.reduce((a, b) => a + b.length, 0);
-            const keyBytes = new Uint8Array(total);
-            let off = 0;
-            for (const s of shards) {
-              keyBytes.set(s, off);
-              off += s.length;
-            }
-            out = xor(out, keyBytes, px.seed & 0xff);
-          }
-        } catch (e) {}
-        return Promise.resolve(out);
+        return Promise.resolve(new Uint8Array(buffer, 0, ${projectData.length}));
       }`;
     } else {
       let src;
@@ -2274,8 +1904,7 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
           if (parts && parts > 1) {
             const base64ToBytes = (b64) => Uint8Array.from(atob(b64), c => c.charCodeAt(0));
             const keyBytes = base64ToBytes(enc.k);
-            const ivB64 = (enc && enc.v === 2 && enc.project && enc.project.iv) ? enc.project.iv : enc.iv;
-            const ivBytes = base64ToBytes(ivB64);
+            const ivBytes = base64ToBytes(enc.iv);
             const labelBytes = new TextEncoder().encode('wb-project');
             const combined = new Uint8Array(keyBytes.length + ivBytes.length + labelBytes.length);
             combined.set(keyBytes, 0);
@@ -2325,14 +1954,13 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
             try {
               ${encryptProject ? `
               const enc = window.__WB_ENC__;
-              if (!enc || !enc.k || (!enc.iv && !(enc.v === 2 && enc.project && enc.project.iv))) throw new Error('Missing encryption metadata');
+              if (!enc || !enc.k || !enc.iv) throw new Error('Missing encryption metadata');
               if (!(crypto && crypto.subtle && crypto.subtle.importKey && crypto.subtle.decrypt)) {
                 throw new Error('WebCrypto is not available');
               }
               const base64ToBytes = (b64) => Uint8Array.from(atob(b64), c => c.charCodeAt(0));
               const keyBytes = base64ToBytes(enc.k);
-              const ivB64 = (enc && enc.v === 2 && enc.project && enc.project.iv) ? enc.project.iv : enc.iv;
-              const ivBytes = base64ToBytes(ivB64);
+              const ivBytes = base64ToBytes(enc.iv);
               const key = await crypto.subtle.importKey('raw', keyBytes, {name: 'AES-GCM'}, false, ['decrypt']);
               const plaintext = await crypto.subtle.decrypt({name: 'AES-GCM', iv: ivBytes}, key, data);
               resolve(plaintext);` : `
@@ -2348,14 +1976,13 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
           try {
             ${encryptProject ? `
             const enc = window.__WB_ENC__;
-            if (!enc || !enc.k || (!enc.iv && !(enc.v === 2 && enc.project && enc.project.iv))) throw new Error('Missing encryption metadata');
+            if (!enc || !enc.k || !enc.iv) throw new Error('Missing encryption metadata');
             if (!(crypto && crypto.subtle && crypto.subtle.importKey && crypto.subtle.decrypt)) {
               throw new Error('WebCrypto is not available');
             }
             const base64ToBytes = (b64) => Uint8Array.from(atob(b64), c => c.charCodeAt(0));
             const keyBytes = base64ToBytes(enc.k);
-            const ivB64 = (enc && enc.v === 2 && enc.project && enc.project.iv) ? enc.project.iv : enc.iv;
-            const ivBytes = base64ToBytes(ivB64);
+            const ivBytes = base64ToBytes(enc.iv);
             const key = await crypto.subtle.importKey('raw', keyBytes, {name: 'AES-GCM'}, false, ['decrypt']);
             let ciphertext = xhr.response;
             const parts = enc && enc.shred && Number(enc.shred.parts);
@@ -2436,7 +2063,7 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
     }
 
     result.push(`
-    <script${nonceAttr}>
+    <script>
       const getProjectData = (function() {
         const storage = scaffolding.storage;
         storage.onprogress = (total, loaded) => {
@@ -2450,64 +2077,6 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
         // Allow zip to be GC'd after project loads
         vm.runtime.on('PROJECT_LOADED', () => (zip = null));
         const findFileInZip = (path) => zip.file(path) || zip.file(new RegExp("^([^/]*/)?" + path + "$"))[0];
-        const initWbRes = (() => {
-          let ready = false;
-          let meta = null;
-          let keyBytes = null;
-          let saltBytes = null;
-          const b64ToBytes = (b64) => Uint8Array.from(atob(b64), c => c.charCodeAt(0));
-          const seedFromName = (name) => {
-            let seed = 0;
-            for (let i = 0; i < name.length; i++) seed = (seed + name.charCodeAt(i)) & 0xff;
-            return seed;
-          };
-          const xor = (bytes, key, seed) => {
-            const out = new Uint8Array(bytes.length);
-            for (let i = 0; i < bytes.length; i++) {
-              out[i] = bytes[i] ^ key[(i + seed) % key.length] ^ seed;
-            }
-            return out;
-          };
-          const ensure = () => {
-            if (ready) return;
-            ready = true;
-            meta = (typeof window === 'object' && window) ? window.__WB_RSP__ : null;
-            if (!meta || !meta.parts || !meta.order || !meta.salt) {
-              meta = null;
-              return;
-            }
-            saltBytes = b64ToBytes(meta.salt);
-            const partCount = meta.parts.length;
-            const parts = meta.parts;
-            const order = meta.order;
-            const shards = [];
-            for (let i = 0; i < partCount; i++) {
-              const physical = order[i];
-              const shardObf = b64ToBytes(parts[physical]);
-              shards.push(xor(shardObf, saltBytes, i & 0xff));
-            }
-            const total = shards.reduce((a, b) => a + b.length, 0);
-            const out = new Uint8Array(total);
-            let off = 0;
-            for (const s of shards) {
-              out.set(s, off);
-              off += s.length;
-            }
-            keyBytes = out;
-          };
-          const tryLoad = async (requestedPath) => {
-            ensure();
-            if (!meta || !meta.map || !keyBytes || !saltBytes) return null;
-            const packedPath = meta.map[requestedPath];
-            if (!packedPath) return null;
-            const file = zip.file(packedPath) || zip.file(new RegExp("^([^/]*/)?" + packedPath + "$"))[0];
-            if (!file) return null;
-            const data = await file.async('uint8array');
-            const seed = (seedFromName(requestedPath) ^ saltBytes[0]) & 0xff;
-            return xor(data, keyBytes, seed);
-          };
-          return {tryLoad};
-        })();
         storage.addHelper({
           load: async (assetType, assetId, dataFormat) => {
             if (!zip) {
@@ -2515,16 +2084,11 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
             }
             const path = assetId + '.' + dataFormat;
             const file = findFileInZip(path);
-            let data;
-            if (file) {
-              data = await file.async('uint8array');
-            } else {
-              data = await initWbRes.tryLoad(path);
-              if (!data) {
-                console.error('Asset is not in zip: ' + path);
-                return Promise.resolve(null);
-              }
+            if (!file) {
+              console.error('Asset is not in zip: ' + path);
+              return Promise.resolve(null);
             }
+            const data = await file.async('uint8array');
             if (window.__WB_UNPACK__) await window.__WB_UNPACK__.ensureInit(zip);
             const decrypted = window.__WB_UNPACK__ ? await window.__WB_UNPACK__.decryptAsset(path, data) : data;
             return storage.createAsset(assetType, dataFormat, decrypted, assetId);
@@ -2539,110 +2103,9 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
           }
 
           const file = findFileInZip('project.json');
-          if (!file) {
-            const packed = await initWbRes.tryLoad('project.json');
-            if (packed) return packed.buffer.slice(packed.byteOffset, packed.byteOffset + packed.byteLength);
-            throw new Error('project.json is not in zip');
-          }
+          if (!file) throw new Error('project.json is not in zip');
           return file.async('arraybuffer');
-        });` : (packResourcesXor && !encryptProject && this.project && this.project.type === 'sb3' && this.options.target !== 'zip-one-asset' ? `
-        const wbResState = {
-          ready: false,
-          initPromise: null,
-          helperInstalled: false,
-          meta: null,
-          keyBytes: null,
-          saltBytes: null
-        };
-        const readFileOrFetch = async (path) => {
-          if (window.EditorPreload && typeof window.EditorPreload.readFile === 'function') {
-            const data = await window.EditorPreload.readFile(path);
-            if (data instanceof Uint8Array) return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
-            if (data instanceof ArrayBuffer) return data;
-            return new Uint8Array(data).buffer;
-          }
-          return await new Promise((resolve, reject) => {
-            const xhr = new XMLHttpRequest();
-            xhr.onload = () => resolve(xhr.response);
-            xhr.onerror = () => reject(new Error('Request failed: ' + path));
-            xhr.responseType = 'arraybuffer';
-            xhr.open('GET', path);
-            xhr.send();
-          });
-        };
-        const b64ToBytes = (b64) => Uint8Array.from(atob(b64), c => c.charCodeAt(0));
-        const xor = (bytes, keyBytes, seed) => {
-          const out = new Uint8Array(bytes.length);
-          for (let i = 0; i < bytes.length; i++) {
-            out[i] = bytes[i] ^ keyBytes[(i + seed) % keyBytes.length] ^ seed;
-          }
-          return out;
-        };
-        const seedFromName = (name) => {
-          let seed = 0;
-          for (let i = 0; i < name.length; i++) seed = (seed + name.charCodeAt(i)) & 0xff;
-          return seed;
-        };
-        const initWbRes = async () => {
-          if (wbResState.ready) return;
-          if (wbResState.initPromise) return wbResState.initPromise;
-          wbResState.initPromise = (async () => {
-            const metaText = new TextDecoder().decode(new Uint8Array(await readFileOrFetch('./wb-res/meta.json')));
-            const meta = JSON.parse(metaText);
-            if (!meta || !meta.parts || !meta.order || !meta.salt || !meta.map) {
-              wbResState.ready = true;
-              return;
-            }
-            wbResState.meta = meta;
-            wbResState.saltBytes = b64ToBytes(meta.salt);
-            const shards = [];
-            for (let i = 0; i < meta.parts.length; i++) {
-              const physical = meta.order[i];
-              const shardObf = b64ToBytes(meta.parts[physical]);
-              shards.push(xor(shardObf, wbResState.saltBytes, i & 0xff));
-            }
-            const total = shards.reduce((a, b) => a + b.length, 0);
-            const keyBytes = new Uint8Array(total);
-            let off = 0;
-            for (const s of shards) {
-              keyBytes.set(s, off);
-              off += s.length;
-            }
-            wbResState.keyBytes = keyBytes;
-            wbResState.ready = true;
-          })();
-          return wbResState.initPromise;
-        };
-        const loadPacked = async (logicalPath) => {
-          await initWbRes();
-          if (!wbResState.meta || !wbResState.keyBytes || !wbResState.saltBytes) return null;
-          const packedPath = wbResState.meta.map[logicalPath];
-          if (!packedPath) return null;
-          const ab = await readFileOrFetch('./' + packedPath);
-          const data = new Uint8Array(ab);
-          const seed = (seedFromName(logicalPath) ^ wbResState.saltBytes[0]) & 0xff;
-          return xor(data, wbResState.keyBytes, seed);
-        };
-        const ensureHelper = async () => {
-          if (wbResState.helperInstalled) return;
-          await initWbRes();
-          if (!wbResState.meta) return;
-          wbResState.helperInstalled = true;
-          storage.addHelper({
-            load: async (assetType, assetId, dataFormat) => {
-              const key = assetId + '.' + dataFormat;
-              const plain = await loadPacked(key);
-              if (!plain) return null;
-              return storage.createAsset(assetType, dataFormat, plain, assetId);
-            }
-          });
-        };
-        return async () => {
-          await ensureHelper();
-          const plain = await loadPacked('project.json');
-          if (!plain) throw new Error('Missing packed project.json');
-          return plain.buffer.slice(plain.byteOffset, plain.byteOffset + plain.byteLength);
-        };` : `
+        });` : `
         storage.addWebStore(
           [
             storage.AssetType.ImageVector,
@@ -2652,7 +2115,7 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
           ].filter(i => i),
           (asset) => new URL('./assets/' + asset.assetId + '.' + asset.dataFormat, location).href
         );
-        return ${getProjectDataFunction};`)}
+        return ${getProjectDataFunction};`}
       })();
     </script>`);
 
@@ -2686,23 +2149,6 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
       }
     }));
 
-    const isSecureCsp = (() => {
-      const wb = this.options && this.options.wb;
-      return !!(wb && wb.secureCsp);
-    })();
-    const extensionLoadStrategy = (() => {
-      const wb = this.options && this.options.wb;
-      const configured = wb && typeof wb.extensionLoadStrategy === 'string' ? wb.extensionLoadStrategy : 'auto';
-      if (configured === 'file' || configured === 'data') return configured;
-      if (this.options && this.options.target === 'html') return 'data';
-      return isSecureCsp ? 'file' : 'data';
-    })();
-    if (extensionLoadStrategy === 'file') {
-      if (!this._embeddedExtensionFiles || typeof this._embeddedExtensionFiles !== 'object') {
-        this._embeddedExtensionFiles = {};
-      }
-    }
-
     const shouldTryToFetch = (url) => {
       if (!this.options.bakeExtensions) {
         return false;
@@ -2721,37 +2167,6 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
     const urlsToFetch = allURLs.filter((url) => shouldTryToFetch(url));
     const finalURLs = [...unfetchableURLs];
 
-    const extractDataUriCode = (dataUri) => {
-      const s = String(dataUri || '');
-      const comma = s.indexOf(',');
-      if (comma === -1) return '';
-      const encoded = s.slice(comma + 1);
-      try {
-        return decodeURIComponent(encoded);
-      } catch (e) {
-        return encoded;
-      }
-    };
-    const storeExtensionAsFile = (code) => {
-      const js = String(code || '');
-      const hash = sha256HexOfString(js);
-      const filePath = `extensions/${hash}.js`;
-      this._embeddedExtensionFiles[filePath] = js;
-      return `./${filePath}`;
-    };
-    const maybeConvertDataUri = (url) => {
-      if (extensionLoadStrategy !== 'file') return url;
-      const s = String(url || '');
-      if (!s.startsWith('data:text/javascript')) return url;
-      const js = extractDataUriCode(s);
-      if (!js) return url;
-      return storeExtensionAsFile(js);
-    };
-
-    for (let i = 0; i < finalURLs.length; i++) {
-      finalURLs[i] = maybeConvertDataUri(finalURLs[i]);
-    }
-
     if (urlsToFetch.length !== 0) {
       for (let i = 0; i < urlsToFetch.length; i++) {
         dispatchProgress(i / urlsToFetch.length);
@@ -2762,12 +2177,8 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
           // likely to cause issues in an unsandboxed environment due to global pollution or
           // overriding Scratch.*
           const wrappedSource = `(function(Scratch) { ${source} })(Scratch);`
-          if (extensionLoadStrategy === 'file') {
-            finalURLs.push(storeExtensionAsFile(wrappedSource));
-          } else {
-            const dataURI = `data:text/javascript;,${encodeURIComponent(wrappedSource)}`;
-            finalURLs.push(dataURI);
-          }
+          const dataURI = `data:text/javascript;,${encodeURIComponent(wrappedSource)}`;
+          finalURLs.push(dataURI);
         } catch (e) {
           console.warn('Could not bake extension', url, e);
           finalURLs.push(url);
@@ -2792,22 +2203,16 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
     this.ensureNotAborted();
     await this.loadPlugins();
     await this.runPluginHook('beforePackage', null, {phase: 'beforePackage'});
-    this._embeddedExtensionFiles = null;
-    const packResourcesXor = !!(this.options.wb && this.options.wb.packResourcesXor);
     const encryptProject = !!(this.options.wb && this.options.wb.encryptProject && this.options.target !== 'html');
     if (encryptProject) {
       if (!(crypto && crypto.subtle && crypto.subtle.importKey && crypto.subtle.encrypt)) {
         throw new Error('WebCrypto is not available');
       }
       const keyBytes = randomBytes(32);
-      const projectIvBytes = randomBytes(12);
+      const ivBytes = randomBytes(12);
       this.wbEncryption = {
-        v: 2,
-        alg: 'A256GCM',
         k: bytesToBase64(keyBytes),
-        project: {
-          iv: bytesToBase64(projectIvBytes)
-        }
+        iv: bytesToBase64(ivBytes)
       };
 
       if (this.project && this.project.type === 'sb3') {
@@ -2935,20 +2340,12 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
       }
     }
     const useCleanTemplate = !!(this.options.wb && this.options.wb.cleanHtmlTemplate);
-    const useSecureCsp = !!(this.options.wb && this.options.wb.secureCsp);
-    const isLocalTarget = String(this.options.target || '').startsWith('electron-') || String(this.options.target || '').startsWith('nwjs-') || String(this.options.target || '') === 'webview-mac';
-    const cspNonce = useSecureCsp ? bytesToBase64(randomBytes(16)).replace(/=+$/g, '') : '';
-    this._wbCspNonce = cspNonce;
-    const scriptNonceAttr = useSecureCsp ? ` nonce="${cspNonce}"` : '';
-    const csp = useSecureCsp
-      ? `default-src 'none'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'none'; img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'nonce-${cspNonce}'; script-src-attr 'none'; connect-src 'self' https: http: ws: wss:${isLocalTarget ? " file:" : ""}; worker-src 'self' blob:;`
-      : "default-src * 'self' 'unsafe-inline' 'unsafe-eval' data: blob:";
-    let html = useCleanTemplate ? encodeBigString`<!DOCTYPE html>
+    const html = useCleanTemplate ? encodeBigString`<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-  <meta http-equiv="Content-Security-Policy" content="${csp}">
+  <meta http-equiv="Content-Security-Policy" content="default-src * 'self' 'unsafe-inline' 'unsafe-eval' data: blob:">
   <title>${escapeXML(this.options.app.windowTitle)}</title>
   <style>
     :root { background: ${this.options.appearance.background}; color: ${this.options.appearance.foreground}; }
@@ -2986,8 +2383,8 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
     </div>
   </div>
 
-  ${this.options.target === 'html' ? `<script${scriptNonceAttr}>${this.script}</script>` : `<script src="script.js"${scriptNonceAttr}></script>`}
-  <script${scriptNonceAttr}>${removeUnnecessaryEmptyLines(`
+  ${this.options.target === 'html' ? `<script>${this.script}</script>` : '<script src="script.js"></script>'}
+  <script>${removeUnnecessaryEmptyLines(`
     const appElement = document.getElementById('app');
     const launchScreen = document.getElementById('launch');
     const loadingScreen = document.getElementById('loading');
@@ -2998,7 +2395,6 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
 
     const handleError = (err) => {
       try { console.error(err); } catch (e) { }
-      try { wbLog && wbLog('error', 'runtime error', String(err && (err.stack || err))); } catch (e) { }
       if (!errorScreen.hidden) return;
       errorScreen.hidden = false;
       if (loadingScreen) loadingScreen.hidden = true;
@@ -3014,22 +2410,6 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
       loadingBar.style.width = (clamped * 100) + '%';
     };
     const interpolate = (a, b, t) => a + t * (b - a);
-    const WB_DEBUG = ${JSON.stringify(!!(this.options.wb && this.options.wb.debugLog))};
-    const WB_VERBOSE = ${JSON.stringify(!!(this.options.wb && this.options.wb.debugLogVerbose))};
-    const WB_SECURE_CSP = ${JSON.stringify(useSecureCsp)};
-    const wbLog = (level, message, data) => {
-      if (!WB_DEBUG) return;
-      const m = String(message || '');
-      try {
-        const fn = (level === 'error' && console.error) ? console.error : console.log;
-        fn.call(console, '[wb]', m, data || '');
-      } catch (e) {}
-      try {
-        if (window.EditorPreload && typeof window.EditorPreload.wbLog === 'function') {
-          window.EditorPreload.wbLog(level || 'info', m, data);
-        }
-      } catch (e) {}
-    };
 
     try {
       setProgress(${PROGRESS_LOADED_SCRIPTS});
@@ -3058,165 +2438,28 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
 
       scaffolding.setExtensionSecurityManager({getSandboxMode: () => 'unsandboxed', canLoadExtensionFromProject: () => true});
       for (const extensionURL of ${JSON.stringify(await this.generateExtensionURLs())}) {
-        if (WB_VERBOSE) wbLog('info', 'loadExtensionURL', extensionURL);
         vm.extensionManager.loadExtensionURL(extensionURL);
       }
 
-      const wbReadFailures = [];
       const readFileOrFetch = async (path) => {
         if (window.EditorPreload && typeof window.EditorPreload.readFile === 'function') {
-          try {
-            const data = await window.EditorPreload.readFile(path);
-            if (data instanceof Uint8Array) return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
-            if (data instanceof ArrayBuffer) return data;
-            return new Uint8Array(data).buffer;
-          } catch (e) {
-            const err = String(e && (e.stack || e));
-            wbReadFailures.push({path, via: 'preload', error: err});
-            if (WB_VERBOSE) wbLog('info', 'EditorPreload.readFile failed, falling back to fetch', {path, error: err});
-          }
+          const data = await window.EditorPreload.readFile(path);
+          if (data instanceof Uint8Array) return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+          if (data instanceof ArrayBuffer) return data;
+          return new Uint8Array(data).buffer;
         }
-        try {
-          const res = await fetch(path, {cache: 'no-store'});
-          if (!res.ok) throw new Error('Failed to load: ' + path + ' (' + res.status + ')');
-          return await res.arrayBuffer();
-        } catch (e) {
-          const err = String(e && (e.stack || e));
-          wbReadFailures.push({path, via: 'fetch', error: err});
-          throw e;
-        }
+        const res = await fetch(path, {cache: 'no-store'});
+        if (!res.ok) throw new Error('Failed to load: ' + path);
+        return await res.arrayBuffer();
       };
 
       const tryRead = async (path) => {
         try {
-          const ab = await readFileOrFetch(path);
-          if (WB_VERBOSE) wbLog('info', 'read ok', {path, bytes: ab ? ab.byteLength : 0});
-          return ab;
+          return await readFileOrFetch(path);
         } catch (e) {
-          if (WB_VERBOSE) wbLog('info', 'read failed', {path, error: String(e && (e.stack || e))});
           return null;
         }
       };
-
-      const wbResPack = (() => {
-        let ready = false;
-        let initPromise = null;
-        let meta = null;
-        let keyBytes = null;
-        let saltBytes = null;
-
-        const b64ToBytes = (b64) => Uint8Array.from(atob(b64), c => c.charCodeAt(0));
-        const seedFromName = (name) => {
-          let seed = 0;
-          for (let i = 0; i < name.length; i++) seed = (seed + name.charCodeAt(i)) & 0xff;
-          return seed;
-        };
-        const xor = (bytes, key, seed) => {
-          const out = new Uint8Array(bytes.length);
-          for (let i = 0; i < bytes.length; i++) {
-            out[i] = bytes[i] ^ key[(i + seed) % key.length] ^ seed;
-          }
-          return out;
-        };
-        const ensure = async () => {
-          if (ready) return;
-          if (initPromise) return initPromise;
-          initPromise = (async () => {
-            meta = window.__WB_RSP__ || null;
-            if (!meta) {
-              const ab = await tryRead('./wb-res/meta.json');
-              if (ab) {
-                try {
-                  const text = new TextDecoder().decode(new Uint8Array(ab));
-                  meta = JSON.parse(text);
-                } catch (e) {
-                  meta = null;
-                }
-              }
-              if (!meta) {
-                const ab2 = await tryRead('./assets/wb-res/meta.json');
-                if (ab2) {
-                  try {
-                    const text2 = new TextDecoder().decode(new Uint8Array(ab2));
-                    meta = JSON.parse(text2);
-                  } catch (e) {
-                    meta = null;
-                  }
-                }
-              }
-            }
-            if (!meta || !meta.parts || !meta.order || !meta.salt || !meta.map) {
-              meta = null;
-              ready = true;
-              return;
-            }
-            saltBytes = b64ToBytes(meta.salt);
-            const partCount = meta.parts.length;
-            const shards = [];
-            for (let i = 0; i < partCount; i++) {
-              const physical = meta.order[i];
-              const shardObf = b64ToBytes(meta.parts[physical]);
-              shards.push(xor(shardObf, saltBytes, i & 0xff));
-            }
-            const total = shards.reduce((a, b) => a + b.length, 0);
-            const out = new Uint8Array(total);
-            let off = 0;
-            for (const s of shards) {
-              out.set(s, off);
-              off += s.length;
-            }
-            keyBytes = out;
-            ready = true;
-          })();
-          return initPromise;
-        };
-        const getKeyCandidates = (p) => {
-          let s = String(p || '');
-          s = s.replace(/^[.][\\/]/, '');
-          s = s.replace(/^[/\\\\]+/, '');
-          const keys = [];
-          keys.push(s);
-          if (s === 'assets/project.json') keys.push('project.json');
-          if (s === 'project.json') keys.push('assets/project.json');
-          if (s.startsWith('assets/')) keys.push(s.slice('assets/'.length));
-          const slash = s.lastIndexOf('/');
-          if (slash !== -1) keys.push(s.slice(slash + 1));
-          const seen = new Set();
-          const out = [];
-          for (const k of keys) {
-            if (!k || seen.has(k)) continue;
-            seen.add(k);
-            out.push(k);
-          }
-          return out;
-        };
-        const loadPacked = async (path) => {
-          await ensure();
-          if (!meta || !keyBytes || !saltBytes) return null;
-          const keys = getKeyCandidates(path);
-          let packedPath = null;
-          let key = null;
-          for (const k of keys) {
-            const p = meta.map[k];
-            if (p) {
-              packedPath = p;
-              key = k;
-              break;
-            }
-          }
-          if (!packedPath || !key) return null;
-          const ab = await tryRead('./' + packedPath);
-          if (!ab) return null;
-          const data = new Uint8Array(ab);
-          const seed = (seedFromName(key) ^ saltBytes[0]) & 0xff;
-          const plain = xor(data, keyBytes, seed);
-          return plain.buffer.slice(plain.byteOffset, plain.byteOffset + plain.byteLength);
-        };
-        return {
-          loadProject: () => loadPacked('./assets/project.json'),
-          loadAsset: (assetId, dataFormat) => loadPacked('./assets/' + assetId + '.' + dataFormat)
-        };
-      })();
 
       const concatBuffers = (buffers) => {
         let total = 0;
@@ -3364,61 +2607,39 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
         };
 
         const enc = window.__WB_ENC__;
-        const ivB64 = (enc && enc.v === 2 && enc.project && enc.project.iv) ? enc.project.iv : (enc && enc.iv);
-        const hasEnc = !!(enc && enc.k && ivB64);
+        const hasEnc = !!(enc && enc.k && enc.iv);
         const base64ToBytes = (b64) => Uint8Array.from(atob(b64), c => c.charCodeAt(0));
-        if (WB_DEBUG) wbLog('info', 'loadProjectData start', {hasEnc});
 
         const tryLoadEncrypted = async () => {
           if (!hasEnc) return null;
           const parts = enc && enc.shred && Number(enc.shred.parts);
           const keyBytes = base64ToBytes(enc.k);
-          const ivBytes = base64ToBytes(ivB64);
-          if (WB_DEBUG) wbLog('info', 'tryLoadEncrypted', {parts: parts || 0});
+          const ivBytes = base64ToBytes(enc.iv);
           if (parts && parts > 1) {
             const order = await computeShardOrder(keyBytes, ivBytes, 'wb-project', parts);
             const buffers = [];
             for (let i = 0; i < parts; i++) {
               const physical = order[i];
-              const b = await tryRead('./wb-project.' + physical + '.wb') || await tryRead('./assets/wb-project.' + physical + '.wb');
+              const b = await tryRead('./wb-project.' + physical + '.wb');
               if (!b) return null;
               buffers.push(b);
             }
             const ciphertext = concatBuffers(buffers);
             const plain = await aesGcmDecrypt(ciphertext, keyBytes, ivBytes);
-            if (WB_DEBUG) wbLog('info', 'encrypted project decrypted', {bytes: plain ? plain.byteLength : 0});
             return await loadProjectZip(plain);
           }
-          const b = await tryRead('./wb-project.bin') || await tryRead('./assets/wb-project.bin');
+          const b = await tryRead('./wb-project.bin');
           if (!b) return null;
           const plain = await aesGcmDecrypt(b, keyBytes, ivBytes);
-          if (WB_DEBUG) wbLog('info', 'encrypted project decrypted', {bytes: plain ? plain.byteLength : 0});
           return await loadProjectZip(plain);
         };
 
         const encrypted = await tryLoadEncrypted();
-        if (encrypted) {
-          if (WB_DEBUG) wbLog('info', 'project source', 'encrypted');
-          return encrypted;
-        }
+        if (encrypted) return encrypted;
 
-        const zipBuffer = await tryRead('./project.zip') || await tryRead('./assets/project.zip');
+        const zipBuffer = await tryRead('./project.zip');
         if (zipBuffer) {
-          if (WB_DEBUG) wbLog('info', 'project source', 'project.zip');
           return await loadProjectZip(zipBuffer);
-        }
-
-        const packedProject = await wbResPack.loadProject();
-        if (packedProject) {
-          if (WB_DEBUG) wbLog('info', 'project source', 'wb-res');
-          storage.addHelper({
-            load: async (assetType, assetId, dataFormat) => {
-              const ab = await wbResPack.loadAsset(assetId, dataFormat);
-              if (!ab) return null;
-              return storage.createAsset(assetType, dataFormat, new Uint8Array(ab), assetId);
-            }
-          });
-          return packedProject;
         }
 
         storage.addWebStore(
@@ -3430,30 +2651,8 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
           ].filter(i => i),
           (asset) => new URL('./assets/' + asset.assetId + '.' + asset.dataFormat, location).href
         );
-        const pj1 = await tryRead('./assets/project.json');
-        if (pj1) return pj1;
-        const pj2 = await tryRead('./project.json');
-        if (pj2) return pj2;
-        const debugChecks = {
-          'wb-res/meta.json': !!(await tryRead('./wb-res/meta.json')),
-          'assets/wb-res/meta.json': !!(await tryRead('./assets/wb-res/meta.json')),
-          'project.zip': !!(await tryRead('./project.zip')),
-          'assets/project.zip': !!(await tryRead('./assets/project.zip')),
-          'wb-project.bin': !!(await tryRead('./wb-project.bin')),
-          'assets/wb-project.bin': !!(await tryRead('./assets/wb-project.bin')),
-          'assets/project.json': !!(await tryRead('./assets/project.json')),
-          'project.json': !!(await tryRead('./project.json')),
-        };
-        const env = {
-          href: location && location.href,
-          protocol: location && location.protocol,
-          origin: location && location.origin,
-          secureCsp: WB_SECURE_CSP,
-          hasEditorPreload: !!(window.EditorPreload && typeof window.EditorPreload.readFile === 'function')
-        };
-        const recentFailures = wbReadFailures.slice(-12);
-        if (WB_DEBUG) wbLog('error', 'missing project.json', {env, debugChecks, recentFailures});
-        throw new Error('Missing project.json; checked: ' + JSON.stringify(debugChecks) + '\\nEnv: ' + JSON.stringify(env) + '\\nRead failures: ' + JSON.stringify(recentFailures));
+        const pj = await readFileOrFetch('./assets/project.json');
+        return pj;
       };
 
       window.__wbStart = async () => {
@@ -3478,16 +2677,16 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
         launchScreen.focus();
       };
 
-      setTimeout(() => start().catch(handleError), 0);
+      start().catch(handleError);
     } catch (e) {
       handleError(e);
     }
   `)}</script>
 
-  ${this.options.custom.js ? `<script${scriptNonceAttr}>
+  ${this.options.custom.js ? `<script>
     try { ${this.options.custom.js} } catch (e) { handleError(e); }
   </script>` : ''}
-  ${this.options.wb && this.options.wb.encryptProject ? `<script${scriptNonceAttr}>window.__WB_ENC__ = ${JSON.stringify(this.wbEncryption ? Object.assign({}, this.wbEncryption, (this.options.wb && this.options.wb.shredWbResources) ? {shred: {parts: 32}} : null) : null)};</script>` : ''}
+  ${this.options.wb && this.options.wb.encryptProject ? `<script>window.__WB_ENC__ = ${JSON.stringify(this.wbEncryption ? Object.assign({}, this.wbEncryption, (this.options.wb && this.options.wb.shredWbResources) ? {shred: {parts: 32}} : null) : null)};</script>` : ''}
 </body>
 </html>
 ` : encodeBigString`<!DOCTYPE html>
@@ -3497,7 +2696,7 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <!-- We only include this to explicitly loosen the CSP of various packager environments. It does not provide any security. -->
-  <meta http-equiv="Content-Security-Policy" content="${csp}">
+  <meta http-equiv="Content-Security-Policy" content="default-src * 'self' 'unsafe-inline' 'unsafe-eval' data: blob:">
   <title>${escapeXML(this.options.app.windowTitle)}</title>
   <style>
     body {
@@ -3670,8 +2869,8 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
     </details>
   </div>
 
-  ${this.options.target === 'html' ? `<script${scriptNonceAttr}>${this.script}</script>` : `<script src="script.js"${scriptNonceAttr}></script>`}
-  <script${scriptNonceAttr}>${removeUnnecessaryEmptyLines(`
+  ${this.options.target === 'html' ? `<script>${this.script}</script>` : '<script src="script.js"></script>'}
+  <script>${removeUnnecessaryEmptyLines(`
     const appElement = document.getElementById('app');
     const launchScreen = document.getElementById('launch');
     const loadingScreen = document.getElementById('loading');
@@ -3899,7 +3098,7 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
       handleError(e);
     }
   `)}</script>
-  ${this.options.custom.js ? `<script${scriptNonceAttr}>
+  ${this.options.custom.js ? `<script>
     try {
       ${this.options.custom.js}
     } catch (e) {
@@ -3907,7 +3106,7 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
     }
   </script>` : ''}
   ${await this.generateGetProjectData()}
-  <script${scriptNonceAttr}>
+  <script>
     const run = async () => {
       const projectData = await getProjectData();
       await scaffolding.loadProject(projectData);
@@ -3938,7 +3137,7 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
     if (encryptRuntime) {
       const htmlText = new TextDecoder().decode(html);
       const inlineScripts = [];
-      const scriptRegex = /<script[^>]*>([\s\S]*?)<\/script>/g;
+      const scriptRegex = /<script>([\s\S]*?)<\/script>/g;
       let m;
       while ((m = scriptRegex.exec(htmlText)) !== null) {
         inlineScripts.push(m[1] || '');
@@ -3968,10 +3167,10 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
 
       let shell = htmlText
         .replace(/<script[^>]*src="script\.js"[^>]*><\/script>/g, '')
-        .replace(/<script[^>]*>[\s\S]*?<\/script>/g, '');
+        .replace(/<script>[\s\S]*?<\/script>/g, '');
 
-      const bootstrapMeta = `window.__WB_APP__ = ${JSON.stringify({k: this.wbEncryption.k, iv: bytesToBase64(ivBytes), shred: (encryptRuntime && shredWbResources) ? {parts: 32} : null, n: (useSecureCsp && cspNonce) ? cspNonce : null})};`;
-      let bootstrap = `(async()=>{try{const app=document.getElementById('app');const loading=document.getElementById('loading');const errorScreen=document.getElementById('error');const errorMessage=document.getElementById('error-message');const errorStack=document.getElementById('error-stack');const handle=(e)=>{try{console.error(e);}catch(_){ }if(errorScreen){errorScreen.hidden=false;if(errorMessage)errorMessage.textContent=''+e;if(errorStack)errorStack.textContent=(e&&e.stack?e.stack:'no stack')+'\\nUser agent: '+navigator.userAgent;}else{alert(''+e);}};const meta=window.__WB_APP__;if(!meta||!meta.k||!meta.iv)throw new Error('Missing app metadata');const b64ToBytes=(b64)=>Uint8Array.from(atob(b64),c=>c.charCodeAt(0));const keyBytes=b64ToBytes(meta.k);const ivBytes=b64ToBytes(meta.iv);const key=await crypto.subtle.importKey('raw',keyBytes,{name:'AES-GCM'},false,['decrypt']);const load=(p)=>{if(window.EditorPreload&&typeof window.EditorPreload.readFile==='function'){return Promise.resolve(window.EditorPreload.readFile(p)).then(x=>x instanceof Uint8Array?x:new Uint8Array(x));}return new Promise((resolve,reject)=>{const xhr=new XMLHttpRequest();xhr.onload=()=>resolve(new Uint8Array(xhr.response));xhr.onerror=()=>reject(new Error('Failed to load app payload'));xhr.responseType='arraybuffer';xhr.open('GET',p);xhr.send();});};let data=null;const parts=meta&&meta.shred&&Number(meta.shred.parts);if(parts&&parts>1){const labelBytes=new TextEncoder().encode('wb-app');const combined=new Uint8Array(keyBytes.length+ivBytes.length+labelBytes.length);combined.set(keyBytes,0);combined.set(ivBytes,keyBytes.length);combined.set(labelBytes,keyBytes.length+ivBytes.length);let seed=0;if(crypto&&crypto.subtle&&crypto.subtle.digest){const digest=await crypto.subtle.digest('SHA-256',combined);seed=new DataView(digest).getUint32(0,false)>>>0;}const xorshift32=(x)=>{x^=x<<13;x^=x>>>17;x^=x<<5;return x>>>0;};const order=Array.from({length:parts},(_,i)=>i);let s=seed>>>0;for(let i=order.length-1;i>0;i--){s=xorshift32(s);const j=s%(i+1);const t=order[i];order[i]=order[j];order[j]=t;}const bufs=[];let total=0;for(let i=0;i<parts;i++){const physical=order[i];const b=await load('./wb-app.'+physical+'.wb');bufs.push(b);total+=b.length;}const out=new Uint8Array(total);let o=0;for(const b of bufs){out.set(b,o);o+=b.length;}data=out.buffer;}else{const b=await load('./wb-app.bin');data=b.buffer;}const plain=await crypto.subtle.decrypt({name:'AES-GCM',iv:ivBytes},key,data);const code=new TextDecoder('utf-8').decode(new Uint8Array(plain));const s=document.createElement('script');try{if(meta&&meta.n)s.setAttribute('nonce',meta.n);}catch(_){ }s.textContent=code;(document.head||document.documentElement).appendChild(s);}catch(e){handle(e);}})();`;
+      const bootstrapMeta = `window.__WB_APP__ = ${JSON.stringify({k: this.wbEncryption.k, iv: bytesToBase64(ivBytes), shred: (encryptRuntime && shredWbResources) ? {parts: 32} : null})};`;
+      let bootstrap = `(async()=>{try{const app=document.getElementById('app');const loading=document.getElementById('loading');const errorScreen=document.getElementById('error');const errorMessage=document.getElementById('error-message');const errorStack=document.getElementById('error-stack');const handle=(e)=>{try{console.error(e);}catch(_){ }if(errorScreen){errorScreen.hidden=false;if(errorMessage)errorMessage.textContent=''+e;if(errorStack)errorStack.textContent=(e&&e.stack?e.stack:'no stack')+'\\nUser agent: '+navigator.userAgent;}else{alert(''+e);}};const meta=window.__WB_APP__;if(!meta||!meta.k||!meta.iv)throw new Error('Missing app metadata');const b64ToBytes=(b64)=>Uint8Array.from(atob(b64),c=>c.charCodeAt(0));const keyBytes=b64ToBytes(meta.k);const ivBytes=b64ToBytes(meta.iv);const key=await crypto.subtle.importKey('raw',keyBytes,{name:'AES-GCM'},false,['decrypt']);const load=(p)=>{if(window.EditorPreload&&typeof window.EditorPreload.readFile==='function'){return Promise.resolve(window.EditorPreload.readFile(p)).then(x=>x instanceof Uint8Array?x:new Uint8Array(x));}return new Promise((resolve,reject)=>{const xhr=new XMLHttpRequest();xhr.onload=()=>resolve(new Uint8Array(xhr.response));xhr.onerror=()=>reject(new Error('Failed to load app payload'));xhr.responseType='arraybuffer';xhr.open('GET',p);xhr.send();});};let data=null;const parts=meta&&meta.shred&&Number(meta.shred.parts);if(parts&&parts>1){const labelBytes=new TextEncoder().encode('wb-app');const combined=new Uint8Array(keyBytes.length+ivBytes.length+labelBytes.length);combined.set(keyBytes,0);combined.set(ivBytes,keyBytes.length);combined.set(labelBytes,keyBytes.length+ivBytes.length);let seed=0;if(crypto&&crypto.subtle&&crypto.subtle.digest){const digest=await crypto.subtle.digest('SHA-256',combined);seed=new DataView(digest).getUint32(0,false)>>>0;}const xorshift32=(x)=>{x^=x<<13;x^=x>>>17;x^=x<<5;return x>>>0;};const order=Array.from({length:parts},(_,i)=>i);let s=seed>>>0;for(let i=order.length-1;i>0;i--){s=xorshift32(s);const j=s%(i+1);const t=order[i];order[i]=order[j];order[j]=t;}const bufs=[];let total=0;for(let i=0;i<parts;i++){const physical=order[i];const b=await load('./wb-app.'+physical+'.wb');bufs.push(b);total+=b.length;}const out=new Uint8Array(total);let o=0;for(const b of bufs){out.set(b,o);o+=b.length;}data=out.buffer;}else{const b=await load('./wb-app.bin');data=b.buffer;}const plain=await crypto.subtle.decrypt({name:'AES-GCM',iv:ivBytes},key,data);const code=new TextDecoder('utf-8').decode(new Uint8Array(plain));const s=document.createElement('script');s.textContent=code;(document.head||document.documentElement).appendChild(s);}catch(e){handle(e);}})();`;
       if (this.options.wb && this.options.wb.obfuscateUnpack) {
         bootstrap = JavaScriptObfuscator.obfuscate(bootstrap, {
           compact: true,
@@ -3986,7 +3185,7 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
         }).getObfuscatedCode();
       }
 
-      const injected = `<script${scriptNonceAttr}>${bootstrapMeta}\n${bootstrap}</script>`;
+      const injected = `<script>${bootstrapMeta}\n${bootstrap}</script>`;
       outputHTML = new TextEncoder().encode(shell.replace('</body>', `${injected}\n</body>`));
     }
     this.ensureNotAborted();
@@ -4003,8 +3202,7 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
         zip = new (await getJSZip());
         if (encryptProject) {
           const keyBytes = Uint8Array.from(atob(this.wbEncryption.k), c => c.charCodeAt(0));
-          const ivB64 = (this.wbEncryption && this.wbEncryption.v === 2 && this.wbEncryption.project && this.wbEncryption.project.iv) ? this.wbEncryption.project.iv : this.wbEncryption.iv;
-          const ivBytes = Uint8Array.from(atob(ivB64), c => c.charCodeAt(0));
+          const ivBytes = Uint8Array.from(atob(this.wbEncryption.iv), c => c.charCodeAt(0));
           const ciphertext = await aesGcmEncrypt(this.project.arrayBuffer, keyBytes, ivBytes);
           const projectBin = new Uint8Array(ciphertext);
           if (shredWbResources) {
@@ -4022,16 +3220,6 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
           zip.file('project.zip', this.project.arrayBuffer);
         }
       }
-      try {
-        const extFiles = this._embeddedExtensionFiles && typeof this._embeddedExtensionFiles === 'object' ? this._embeddedExtensionFiles : null;
-        if (extFiles) {
-          for (const [p, code] of Object.entries(extFiles)) {
-            if (typeof p === 'string' && p && typeof code === 'string') {
-              zip.file(p, code);
-            }
-          }
-        }
-      } catch (e) {}
       zip.file('index.html', outputHTML);
       if (encryptRuntime) {
         if (shredWbResources) {
@@ -4043,43 +3231,6 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
         }
       } else {
         zip.file('script.js', this.script);
-      }
-
-      if (packResourcesXor && !encryptProject) {
-        try {
-          const keyBytes = randomBytes(32);
-          const saltBytes = randomBytes(16);
-          const meta = buildXorResourcePackMeta(this.options.projectId, keyBytes, saltBytes);
-          const paths = Object.keys(zip.files || {}).filter((p) => {
-            const f = zip.files[p];
-            if (!f || f.dir) return false;
-            if (p === 'index.html') return false;
-            if (p.startsWith('wb-res/')) return false;
-            if (p.startsWith('assets/')) return true;
-            if (p === 'project.json' || p.endsWith('/project.json')) return true;
-            return false;
-          });
-          for (const originalPath of paths) {
-            const f = zip.file(originalPath);
-            if (!f) continue;
-            const key = normalizePackedResourceKey(originalPath);
-            const packedPath = `wb-res/${bytesToHex(randomBytes(8))}.wb`;
-            const plain = await f.async('uint8array');
-            const seed = (fileSeed(key) ^ saltBytes[0]) & 0xff;
-            const enc = xorCrypt(plain, keyBytes, seed);
-            meta.map[key] = packedPath;
-            zip.file(packedPath, enc);
-            zip.remove(originalPath);
-          }
-          zip.file('wb-res/meta.json', JSON.stringify(meta));
-          const indexFile = zip.file('index.html');
-          if (indexFile) {
-            const htmlBytes = await indexFile.async('uint8array');
-            zip.file('index.html', injectWbResMetaIntoHtml(htmlBytes, meta, this._wbCspNonce));
-          }
-        } catch (e) {
-          console.warn(e);
-        }
       }
 
       if (this.options.target.startsWith('nwjs-')) {
@@ -4203,9 +3354,6 @@ Packager.DEFAULT_OPTIONS = () => ({
   app: {
     icon: null,
     writeWindowsExeIcon: true,
-    exportWindowsIco: false,
-    writeMacElectronIcns: true,
-    exportLinuxDesktopFile: false,
     packageName: Packager.getDefaultPackageNameFromFileName(''),
     windowTitle: Packager.getWindowTitleFromFileName(''),
     windowMode: 'window',
@@ -4251,34 +3399,13 @@ Packager.DEFAULT_OPTIONS = () => ({
     splitElectronEntry: false,
     shredWbResources: false,
     cleanHtmlTemplate: false,
-    extensionLoadStrategy: 'auto',
-    debugLog: false,
-    debugLogVerbose: false,
     enablePluginDir: false,
     pluginDir: 'plugins',
     obfuscateUnpack: true,
     disableDevtools: true,
     verifyScriptHash: true,
-    verifyIndexHash: true,
-    secureCsp: false,
-    packResourcesXor: false,
-    integrity: {
-      enabled: false,
-      required: false,
-      kid: '',
-      publicKeys: {},
-      manifestName: 'wb-integrity.json',
-      signatureName: 'wb-integrity.sig'
-    }
+    verifyIndexHash: true
   }
 });
-
-Packager._test = {
-  buildXorResourcePackMeta,
-  normalizePackedResourceKey,
-  injectWbResMetaIntoHtml,
-  xorCrypt,
-  fileSeed
-};
 
 export default Packager;

@@ -53,6 +53,7 @@ Converts Scratch projects into HTML files, zip archives, or executable programs 
 - plugins-available/obfuscate-extension-plugins.cjs
 - src/locales/en.json
 - src/locales/zh-cn.json
+- src/packager/web/adapter.js
 
 ## Development
 
