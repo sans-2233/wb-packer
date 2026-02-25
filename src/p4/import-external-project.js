@@ -91,7 +91,12 @@ const importFromAPI = async ({
 }) => {
   try {
     onStartImporting();
-    const {data, name} = await GlobalPackagerImporter();
+    const payload = await GlobalPackagerImporter();
+    const {data, name, staticAssets} = payload || {};
+    try {
+      window.__WB_PACKAGER_STATIC_ASSETS__ = Array.isArray(staticAssets) ? staticAssets : null;
+    } catch (e) {
+    }
     onFinishImporting(toFileList(data, name));
   } catch (e) {
     onCancelImporting();

@@ -49,8 +49,18 @@
     return i;
   });
 
+  $: if ($options && typeof $options.target === 'string') {
+    const t = $options.target;
+    if (t !== 'html' && t !== 'node-cli' && !t.startsWith('electron-')) {
+      $options.target = 'html';
+    }
+  }
+
   $: if (!$options.wb) {
     $options.wb = deepClone(defaultOptions.wb);
+  }
+  $: if (!$options.wb.codeSigning) {
+    $options.wb.codeSigning = deepClone(defaultOptions.wb.codeSigning);
   }
 
   const hasMagicComment = (magic) => projectData.project.analysis.stageComments.find(
@@ -65,6 +75,8 @@
   let pluginEntries = [];
   let pluginDebug = [];
   let lastPackagerInfo = null;
+  let signingTools = null;
+  let signingToolsError = '';
   const resetResult = () => {
     previewer = null;
     if (result) {
@@ -97,10 +109,11 @@
 
   const otherEnvironmentsInitiallyOpen = ![
     'html',
-    'zip',
-    'electron-win32',
-    'webview-mac',
-    'electron-linux64'
+    'node-cli',
+    'electron-win64',
+    'electron-mac',
+    'electron-linux64',
+    'electron-win32'
   ].includes($options.target);
 
   const advancedOptionsInitiallyOpen = (
@@ -154,12 +167,8 @@
     });
     packager.addEventListener('large-asset-fetch', ({detail}) => {
       let thing;
-      if (detail.asset.startsWith('nwjs-')) {
-        thing = 'NW.js';
-      } else if (detail.asset.startsWith('electron-')) {
+      if (detail.asset.startsWith('electron-')) {
         thing = 'Electron';
-      } else if (detail.asset === 'webview-mac') {
-        thing = 'WKWebView';
       } else if (detail.asset === 'steamworks.js') {
         thing = 'Steamworks.js';
       }
@@ -186,10 +195,34 @@
 
   const pack = async () => {
     resetResult();
-    const task = new Task();
-    result = await task.do(runPackager(task, deepClone($options)));
-    task.done();
-    downloadURL(result.filename, result.url);
+    let optionsClone = deepClone($options);
+    while (true) {
+      const task = new Task();
+      try {
+        result = await task.do(runPackager(task, optionsClone));
+        downloadURL(result.filename, result.url);
+        return;
+      } catch (e) {
+        if (e && e.name === 'WBCustomExtensionsError' && Array.isArray(e.customExtensions)) {
+          const items = e.customExtensions
+            .map(i => i && typeof i.id === 'string' && typeof i.url === 'string' ? `${i.id}: ${i.url}` : null)
+            .filter(i => i);
+          const text = items.length ? items.join('\n') : '(unknown)';
+          const ok = confirm(
+            `检测到项目包含自定义拓展（权限极高，可能联网/读写/执行任意 JS）。\n\n${text}\n\n确定：允许继续打包并在运行时自动加载这些自定义拓展。\n取消：继续打包但移除这些自定义拓展（作品功能可能缺失）。`
+          );
+          optionsClone.wb.allowCustomExtensionsFromProject = ok;
+          optionsClone.wb.stripCustomExtensionsFromProject = !ok;
+          if (!Array.isArray(optionsClone.wb.unsandboxedExtensionUrlKeywords)) {
+            optionsClone.wb.unsandboxedExtensionUrlKeywords = [];
+          }
+          continue;
+        }
+        throw e;
+      } finally {
+        task.done();
+      }
+    }
   };
 
   const preview = async () => {
@@ -382,9 +415,28 @@
     showPlugins = true;
   };
 
+  const detectSigningTools = async () => {
+    signingToolsError = '';
+    signingTools = null;
+    try {
+      const api = typeof window !== 'undefined' ? window.PackagerSigningPreload : null;
+      if (!api || typeof api.detectTools !== 'function') {
+        signingToolsError = '签名功能仅在桌面版可用。';
+        return;
+      }
+      signingTools = await api.detectTools();
+      if (!signingTools || signingTools.ok === false) {
+        signingToolsError = (signingTools && signingTools.error) ? String(signingTools.error) : '检测失败';
+      }
+    } catch (e) {
+      signingToolsError = String(e && (e.stack || e));
+    }
+  };
+
   onMount(() => {
     if (typeof window !== 'undefined' && window.IsDesktop && $options && $options.wb) {
       $options.wb.enablePluginDir = true;
+      detectSigningTools();
     }
   });
 </script>
@@ -958,8 +1010,49 @@
       </label>
       <label class="option">
         <input type="checkbox" bind:checked={$options.wb.packResourcesXor} />
-        资源封包(实现很简单!不要指望能当作加密来用 只能防止直接提取)
+        资源 XOR 封包（仅 assets/extensions/static_assets，不包含 project.json；路径不变）
       </label>
+      <label class="option">
+        <input type="checkbox" bind:checked={$options.wb.encryptProject} />
+        加密项目数据（AES-GCM；导出时动态生成密钥）
+      </label>
+      {#if $options.wb.encryptProject}
+        <label class="option">
+          <input type="checkbox" bind:checked={$options.wb.encryptRuntime} />
+          加密运行时脚本（Electron；将 script/内联脚本打包为加密负载）
+        </label>
+        <label class="option">
+          <input type="checkbox" bind:checked={$options.wb.shredWbResources} />
+          分片打散（配合加密；减少固定结构特征）
+        </label>
+        <label class="option">
+          <input type="checkbox" bind:checked={$options.wb.obfuscateUnpack} />
+          混淆解包引导脚本（会增加体积与启动时间）
+        </label>
+        <p class="warning">提示：加密相关选项仅对 Electron / Node-CLI 生效，HTML 目标会被忽略。</p>
+      {/if}
+      <label class="option">
+        <input type="checkbox" bind:checked={$options.wb.compileProjectToJS} />
+        将项目数据封装到 JS 文件中（部分环境中不再单独打包 project.json）
+      </label>
+      <label class="option">
+        <input type="checkbox" bind:checked={$options.wb.compileProjectRuntimeJS} />
+        预编译脚本为 JS 并剥离积木结构（实验功能）
+      </label>
+      <label class="option">
+        <input type="checkbox" bind:checked={$options.wb.allowCustomExtensionsFromProject} />
+        允许从项目自动加载自定义拓展（有安全风险）
+      </label>
+      <label class="option">
+        <input type="checkbox" bind:checked={$options.wb.disableExtensionSecurity} />
+        打包运行时关闭扩展安全限制（仅限内部自用）
+      </label>
+      {#if $options.wb.allowCustomExtensionsFromProject}
+        <label class="option">
+          unsandboxed 扩展 URL 关键字（每行一个，匹配则以 unsandboxed 加载）
+          <CustomExtensions bind:extensions={$options.wb.unsandboxedExtensionUrlKeywords} />
+        </label>
+      {/if}
       <label class="option">
         <input type="checkbox" bind:checked={$options.wb.debugLog} />
         输出运行时/资源加载诊断日志
@@ -978,6 +1071,103 @@
           <option value="data">data URL</option>
         </select>
       </label>
+
+      <h3>签名 / 发行</h3>
+      <label class="option">
+        <input type="checkbox" bind:checked={$options.wb.codeSigning.enabled} />
+        导出后执行代码签名（仅桌面版；需本机安装签名工具）
+      </label>
+      {#if $options.wb.codeSigning.enabled}
+        <div class="group">
+          <Button on:click={detectSigningTools} secondary text="检测本机签名工具" />
+        </div>
+        {#if signingTools && signingTools.platform}
+          <p class="mono">当前平台：{signingTools.platform}</p>
+        {/if}
+        {#if signingToolsError}
+          <p class="warning">{signingToolsError}</p>
+        {/if}
+
+        <details class="group">
+          <summary>Windows（signtool）</summary>
+          <p>需要 Windows SDK（signtool.exe）。官方文档：<a href="https://learn.microsoft.com/windows/win32/seccrypto/signtool" target="_blank" rel="noreferrer">Signtool</a></p>
+          <label class="option">
+            模式
+            <select bind:value={$options.wb.codeSigning.windows.mode}>
+              <option value="pfx">PFX 文件</option>
+              <option value="store">证书库（Subject 名称）</option>
+            </select>
+          </label>
+          {#if $options.wb.codeSigning.windows.mode === 'pfx'}
+            <label class="option">
+              PFX 路径（桌面版本机路径）
+              <input type="text" class="shorter" bind:value={$options.wb.codeSigning.windows.pfxPath} />
+            </label>
+            <p>密码会在导出时弹窗输入，不会保存到配置。</p>
+          {:else}
+            <label class="option">
+              证书 Subject 名称
+              <input type="text" class="shorter" bind:value={$options.wb.codeSigning.windows.certSubject} />
+            </label>
+          {/if}
+          <label class="option">
+            时间戳 URL
+            <input type="text" bind:value={$options.wb.codeSigning.windows.timestampUrl} />
+          </label>
+          <label class="option">
+            描述（/d）
+            <input type="text" class="shorter" bind:value={$options.wb.codeSigning.windows.description} />
+          </label>
+          <label class="option">
+            <input type="checkbox" bind:checked={$options.wb.codeSigning.windows.signAllFiles} />
+            尝试签名目录内所有 exe/dll（较慢）
+          </label>
+          <p class="mono">提示：Windows 签名只能在 Windows 上执行。</p>
+        </details>
+
+        <details class="group">
+          <summary>macOS（codesign）</summary>
+          <p>需要 Xcode Command Line Tools（codesign）以及 zip。官方：<a href="https://developer.apple.com/documentation/security/notarizing_macos_software_before_distribution" target="_blank" rel="noreferrer">Notarization</a></p>
+          <label class="option">
+            codesign identity（Keychain 中的签名身份）
+            <input type="text" bind:value={$options.wb.codeSigning.mac.identity} />
+          </label>
+          <label class="option">
+            <input type="checkbox" bind:checked={$options.wb.codeSigning.mac.hardenedRuntime} />
+            hardened runtime（--options runtime）
+          </label>
+          <label class="option">
+            <input type="checkbox" bind:checked={$options.wb.codeSigning.mac.timestamp} />
+            time-stamp（--timestamp）
+          </label>
+          <label class="option">
+            <input type="checkbox" bind:checked={$options.wb.codeSigning.mac.deep} />
+            deep（--deep）
+          </label>
+          <p class="mono">提示：macOS 签名只能在 macOS 上执行。</p>
+        </details>
+
+        <details class="group">
+          <summary>Linux（GPG 签名文件）</summary>
+          <p>Linux 没有统一的 zip 代码签名；这里会生成 SHA256SUMS，并可选用 GPG 生成 detached signature。GnuPG：<a href="https://gnupg.org/download/" target="_blank" rel="noreferrer">Download</a></p>
+          <label class="option">
+            工具
+            <select bind:value={$options.wb.codeSigning.linux.tool}>
+              <option value="gpg">gpg</option>
+            </select>
+          </label>
+          <label class="option">
+            key id（可选；为空则只生成 SHA256SUMS）
+            <input type="text" class="shorter" bind:value={$options.wb.codeSigning.linux.keyId} />
+          </label>
+          <label class="option">
+            <input type="checkbox" bind:checked={$options.wb.codeSigning.linux.armor} />
+            ASCII armor（--armor）
+          </label>
+          <p class="mono">提示：Linux 签名只能在 Linux 上执行。</p>
+        </details>
+      {/if}
+
       {#if lastPackagerInfo}
         <details class="group">
           <summary>最近一次导出摘要</summary>
@@ -1011,6 +1201,7 @@
         启用 plugins 目录（导出时生效）
       </label>
       <p class="mono">示例插件：plugins-available/legal-notice-and-integrity.cjs</p>
+      <p class="mono">插件 API：wb-packager/docs/plugin-api.md</p>
       {#if pluginDir}
         <p class="mono">{pluginDir}</p>
       {:else}
@@ -1064,19 +1255,19 @@
         {$_('options.html')}
       </label>
       <label class="option">
-        <input type="radio" name="environment" bind:group={$options.target} value="zip">
-        {$_('options.zip')}
+        <input type="radio" name="environment" bind:group={$options.target} value="node-cli">
+        Node.js CLI（无图形）
       </label>
     </div>
 
     <div class="group">
       <label class="option">
-        <input type="radio" name="environment" bind:group={$options.target} value="electron-win32">
-        {$_('options.application-win32').replace('{type}', 'Electron')}
+        <input type="radio" name="environment" bind:group={$options.target} value="electron-win64">
+        {$_('options.application-win64').replace('{type}', 'Electron')}
       </label>
       <label class="option">
-        <input type="radio" name="environment" bind:group={$options.target} value="webview-mac">
-        {$_('options.application-mac').replace('{type}', 'WKWebView')}
+        <input type="radio" name="environment" bind:group={$options.target} value="electron-mac">
+        {$_('options.application-mac').replace('{type}', 'Electron')}
       </label>
       <label class="option">
         <input type="radio" name="environment" bind:group={$options.target} value="electron-linux64">
@@ -1085,64 +1276,22 @@
     </div>
 
     <details open={otherEnvironmentsInitiallyOpen}>
-      <summary>{$_('options.otherEnvironments')}</summary>
-      <p>{$_('options.otherEnvironmentsHelp')}</p>
+      <summary>其他架构</summary>
       <div class="group">
         <label class="option">
-          <input type="radio" name="environment" bind:group={$options.target} value="zip-one-asset">
-          {$_('options.zip-one-asset')}
-        </label>
-      </div>
-      <div class="group">
-        <label class="option">
-          <input type="radio" name="environment" bind:group={$options.target} value="electron-win64">
-          {$_('options.application-win64').replace('{type}', 'Electron')}
-        </label>
-        <label class="option">
-          <input type="radio" name="environment" bind:group={$options.target} value="electron-win-arm">
-          {$_('options.application-win-arm').replace('{type}', 'Electron')}
-        </label>
-        <label class="option">
-          <input type="radio" name="environment" bind:group={$options.target} value="electron-mac">
-          {$_('options.application-mac').replace('{type}', 'Electron')}
-        </label>
-        <label class="option">
-          <input type="radio" name="environment" bind:group={$options.target} value="electron-linux-arm32">
-          {$_('options.application-linux-arm32').replace('{type}', 'Electron')}
-        </label>
-        <label class="option">
-          <input type="radio" name="environment" bind:group={$options.target} value="electron-linux-arm64">
-          {$_('options.application-linux-arm64').replace('{type}', 'Electron')}
-        </label>  
-      </div>
-
-      <div class="group">
-        <label class="option">
-          <input type="radio" name="environment" bind:group={$options.target} value="nwjs-win32">
-          {$_('options.application-win32').replace('{type}', 'NW.js')}
-        </label>
-        <label class="option">
-          <input type="radio" name="environment" bind:group={$options.target} value="nwjs-win64">
-          {$_('options.application-win64').replace('{type}', 'NW.js')}
-        </label>
-        <label class="option">
-          <input type="radio" name="environment" bind:group={$options.target} value="nwjs-mac">
-          {$_('options.application-mac').replace('{type}', 'NW.js')}
-        </label>
-        <label class="option">
-          <input type="radio" name="environment" bind:group={$options.target} value="nwjs-linux-x64">
-          {$_('options.application-linux64').replace('{type}', 'NW.js')}
+          <input type="radio" name="environment" bind:group={$options.target} value="electron-win32">
+          {$_('options.application-win32').replace('{type}', 'Electron')}
         </label>
       </div>
     </details>
   </div>
 </Section>
 
-{#if $options.target !== 'html'}
+{#if $options.target.startsWith('electron-')}
   <div in:fade|local>
     <Section
       accent="#FF661A"
-      reset={$options.target.startsWith('zip') ? null : () => {
+      reset={() => {
         resetOptions([
           'app.packageName',
           'app.windowMode',
@@ -1152,128 +1301,74 @@
       }}
     >
       <div>
-        {#if $options.target.startsWith('zip')}
-          <h2>Zip</h2>
-          <p>The zip environment is intended to be used for publishing to a website. Other uses such as sending your project to a friend over a chat app or email should use "Plain HTML" instead as zip will not work.</p>
-        {:else}
-          <h2>{$_('options.applicationSettings')}</h2>
-          <label class="option">
-            {$_('options.packageName')}
-            <input type="text" bind:value={$options.app.packageName} pattern="[\w \-]+" minlength="1">
-          </label>
-          <p>{$_('options.packageNameHelp')}</p>
+        <h2>{$_('options.applicationSettings')}</h2>
+        <label class="option">
+          {$_('options.packageName')}
+          <input type="text" bind:value={$options.app.packageName} pattern="[\w \-]+" minlength="1">
+        </label>
+        <p>{$_('options.packageNameHelp')}</p>
 
-          <label class="option">
-            {$_('options.version')}
-            <input type="text" class="version" bind:value={$options.app.version} pattern="\d+\.\d+\.\d+" placeholder="1.0.0" minlength="1">
-          </label>
-          <p>{$_('options.versionHelp')}</p>
+        <label class="option">
+          {$_('options.version')}
+          <input type="text" class="version" bind:value={$options.app.version} pattern="\d+\.\d+\.\d+" placeholder="1.0.0" minlength="1">
+        </label>
+        <p>{$_('options.versionHelp')}</p>
 
-          {#if $options.target.includes('electron')}
-            <label class="option">
-              {$_('options.initalWindowSize')}
-              <select bind:value={$options.app.windowMode}>
-                <option value="window">{$_('options.startWindow')}</option>
-                <option value="maximize">{$_('options.startMaximized')}</option>
-                <option value="fullscreen">{$_('options.startFullscreen')}</option>
-              </select>
-            </label>
+        <label class="option">
+          {$_('options.initalWindowSize')}
+          <select bind:value={$options.app.windowMode}>
+            <option value="window">{$_('options.startWindow')}</option>
+            <option value="maximize">{$_('options.startMaximized')}</option>
+            <option value="fullscreen">{$_('options.startFullscreen')}</option>
+          </select>
+        </label>
 
-            <label class="option">
-              {$_('options.escapeBehavior')}
-              <select bind:value={$options.app.escapeBehavior}>
-                <option value="unfullscreen-only">{$_('options.unFullscreenOnly')}</option>
-                <option value="exit-only">{$_('options.exitOnly')}</option>
-                <option value="unfullscreen-or-exit">{$_('options.unFullscreenOrExit')}</option>
-                <option value="nothing">{$_('options.doNothing')}</option>
-              </select>
-            </label>
+        <label class="option">
+          {$_('options.escapeBehavior')}
+          <select bind:value={$options.app.escapeBehavior}>
+            <option value="unfullscreen-only">{$_('options.unFullscreenOnly')}</option>
+            <option value="exit-only">{$_('options.exitOnly')}</option>
+            <option value="unfullscreen-or-exit">{$_('options.unFullscreenOrExit')}</option>
+            <option value="nothing">{$_('options.doNothing')}</option>
+          </select>
+        </label>
 
-            <label class="option">
-              {$_('options.windowControls')}
-              <select bind:value={$options.app.windowControls}>
-                <option value="default">{$_('options.defaultControls')}</option>
-                <option value="frameless">{$_('options.noControls')}</option>
-              </select>
-            </label>
+        <label class="option">
+          {$_('options.windowControls')}
+          <select bind:value={$options.app.windowControls}>
+            <option value="default">{$_('options.defaultControls')}</option>
+            <option value="frameless">{$_('options.noControls')}</option>
+          </select>
+        </label>
 
-            <label class="option">
-              <input type="checkbox" bind:checked={$options.app.backgroundThrottling}>
-              {$_('options.backgroundThrottling')}
-            </label>
-          {/if}
+        <label class="option">
+          <input type="checkbox" bind:checked={$options.app.backgroundThrottling}>
+          {$_('options.backgroundThrottling')}
+        </label>
 
-          <div class="warning">
-            <div>Creating native applications for specific platforms is discouraged. In most cases, Plain HTML or Zip will have numerous advantages:</div>
-            <ul>
-              <li>Can be run directly from a website on any platform, even phones</li>
-              <li>Users are significantly less likely to be suspicious of a virus</li>
-              <li>Significantly smaller file size</li>
-              <li>Can still be downloaded locally and run offline</li>
-            </ul>
-            <div>If you don't truly need to make a self-contained application for each platform (we understand there are some cases where this is necessary), we recommend you don't.</div>
+        <div class="warning">
+          <div>Electron 产物体积较大且发布需要签名。建议：</div>
+          <ul>
+            <li>仅在确实需要“离线桌面应用壳”时使用 Electron</li>
+            <li>发布给用户前使用本页面的签名功能（需要本机安装签名工具）</li>
+          </ul>
+        </div>
+
+        {#if $options.target.includes('win')}
+          <div>
+            <h2>Windows</h2>
+            <p>未签名的 exe 会触发 SmartScreen。建议在桌面版开启“签名 / 发行”并配置 signtool。</p>
           </div>
-
-          {#if $options.target.includes('win')}
-            <div>
-              <h2>Windows</h2>
-              <p>All Windows applications generated by this site are unsigned, so users will see SmartScreen warnings when they try to run it for the first time. They can bypass these warnings by pressing "More info" then "Run anyways".</p>
-              <p>To change the icon of the executable file or create an installer program, download and run <a href="https://github.com/TurboWarp/packager-extras/releases">TurboWarp Packager Extras</a> and select the output of this website.</p>
-            </div>
-          {:else if $options.target.includes('mac')}
-            <div>
-              <h2>macOS</h2>
-              <p>Due to Apple policy, packaging for their platforms is troublesome. You either have to:</p>
-              <ul>
-                <li>Instruct users to ignore scary Gatekeeper warnings by opening Finder > Navigating to the application > Right click > Open > Open. This website generates applications that require this workaround.</li>
-                <li>Or pay Apple $100/year for a developer account to sign and notarize the app (very involved process; reach out in feedback for more information)</li>
-              </ul>
-            </div>
-          {:else if $options.target.includes('linux')}
-            <div>
-              <h2>Linux</h2>
-              <p>Linux support is still experimental.</p>
-            </div>
-          {/if}
-
-          {#if $options.target.includes('electron')}
-            <div>
-              <h2>Electron</h2>
-              <p>The Electron environment works by embedding a copy of Chromium (the open source part of Google Chrome) along with your project, which means the app will be very large.</p>
-
-              {#if $options.target.includes('win')}
-                {#if $options.target.includes('32')}
-                  <p>Note: You have selected the 32-bit or 64-bit mode. This maximizes device compatibility but limits the amount of memory the app can use. If you encounter crashes, try going into "Other environments" and using the 64-bit only mode instead.</p>
-                {/if}
-              {:else if $options.target.includes('mac')}
-                <p>On macOS, the app will run natively on both Intel Silicon and Apple Silicon Macs.</p>
-              {:else if $options.target.includes('linux')}
-                <p>On Linux, the application can be started by running <code>start.sh</code></p>
-              {/if}
-            </div>
-          {:else if $options.target.includes('nwjs')}
-            <div>
-              <h2>NW.js</h2>
-              <p>The NW.js environment works by embedding a copy of Chromium (the open source part of Google Chrome) along with your project, which means the app will be very large.</p>
-              <p>For further help and steps, see <a href="https://docs.nwjs.io/en/latest/For%20Users/Package%20and%20Distribute/#linux">NW.js Documentation</a>.</p>
-              {#if $options.target.includes('mac')}
-                <p>On macOS, the app will run using Rosetta on Apple Silicon Macs.</p>
-              {/if}
-            </div>
-          {:else if $options.target.includes('webview-mac')}
-            <div>
-              <h2>WKWebView</h2>
-              <p>WKWebView is the preferred way to package for macOS. It will be hundreds of MB smaller than the other macOS-specific environments and typically run the fastest.</p>
-              <p>The app will run natively on both Intel and Apple silicon Macs running macOS 10.13 or later.</p>
-              <p>Note that:</p>
-              <ul>
-                <li>Video sensing and loudness blocks will only work in macOS 12 or later.</li>
-                <li>Pointer lock will not work.</li>
-                <li>Extremely large projects might not work properly.</li>
-              </ul>
-              <p>Use the "Electron macOS Application" (inside Other environments) or "Plain HTML" environments instead if you encounter these issues.</p>
-            </div>
-          {/if}
+        {:else if $options.target.includes('mac')}
+          <div>
+            <h2>macOS</h2>
+            <p>未签名的 app 会触发 Gatekeeper。建议在 macOS 上执行 codesign（如需分发再做 notarize）。</p>
+          </div>
+        {:else if $options.target.includes('linux')}
+          <div>
+            <h2>Linux</h2>
+            <p>Linux 通常以校验/签名文件形式发布（SHA256SUMS + GPG）。</p>
+          </div>
         {/if}
       </div>
     </Section>

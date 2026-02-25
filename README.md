@@ -2,33 +2,56 @@
 
 上游项目：TurboWarp Packager（https://packager.turbowarp.org/）
 
-Converts Scratch projects into HTML files, zip archives, or executable programs for Windows, macOS, and Linux.
+Converts Scratch projects into plain HTML or Electron programs for Windows, macOS, and Linux.
 
 ## 更新记录
 
-见 [CHANGELOG.md](file:///g:/工程/javascript/desktop/wb-packager/CHANGELOG.md)
+见 [CHANGELOG.md](wb-packager/CHANGELOG.md)
 
 ## 本仓库的定位与边界
 
 - 这是一个“修改版”仓库：在上游 packager 的基础上增加了插件系统与打包保护相关的选项整合
 - 本仓库公开内容：packer/插件系统本体与可公开的示例插件（见 plugins-available）
 - 本仓库不包含：任何闭源插件源码、任何构建产物（dist、打包目录等）
-- 许可证：本仓库包含并遵循 MPL-2.0（见 [LICENSE](file:///g:/工程/javascript/desktop/wb-packager/LICENSE)），额外声明见 [NOTICE.md](file:///g:/工程/javascript/desktop/wb-packager/NOTICE.md)
+- 许可证：本仓库包含并遵循 MPL-2.0（见 [LICENSE](wb-packager/LICENSE)），额外声明见 [NOTICE.md](wb-packager/NOTICE.md)
 
 ## 插件系统（简述）
 
 - 加载来源（Node 环境）：可从指定目录加载 `.js/.cjs` 插件文件
-- Hook：插件可实现 `hooks.beforePackage`、`hooks.transformProjectJson` 等来影响打包过程；同时支持构建期签名 hook：`hooks.signIntegrityManifest`
+- Hook：插件可实现 `hooks.beforePackage`、`hooks.transformProjectJson`、`hooks.transformCompiledProject` 等来影响打包过程；同时支持构建期签名 hook：`hooks.signIntegrityManifest`
 - 安全提示：插件是可执行代码，请勿加载不可信来源的插件
+
+### JS 编译与混淆相关插件
+
+- 当启用 `options.wb.compileProjectToJS` 时，packager 会在 sb3 解包后生成 `wb-project.js`，其中包含以 Base64 形式封装的项目二进制数据，并在部分目标下不再单独打包 `assets/project.json`
+- 生成的 `wb-project.js` 会作为字符串传入 `hooks.transformCompiledProject(code, ctx)`，插件可在此阶段使用 `ctx.libs.JavaScriptObfuscator` 等手段对其进行二次处理（例如压缩、重写、混淆等）
+- 插件本身可以作为独立模块维护，并仅通过上述 Hook 与 packager 交互
+
+### 预编译脚本导出（实验）
+
+- 当启用 `options.wb.compileProjectRuntimeJS` 时，packager 会在打包阶段调用 scratch-vm 的编译器预编译所有 hat 脚本，生成：`compiled-project.js`（脚本表）与 `assets/project-meta.json`（结构文件，不含 blocks）
+- 该模式下产物不再包含 `project.json`/`project.zip`（或任何包含 blocks 的 JSON）
+- `compiled-project.js` 同样会传入 `hooks.transformCompiledProject(code, ctx)`，并以 `ctx.phase = 'precompiledRuntimeJS'` 作为区分
+
+## 代码签名（宿主环境支持）
+
+本仓库提供一个“导出后签名”的可选步骤（仅对 Electron 目标生效）。由于浏览器环境无法调用本机签名工具链，该功能需要宿主环境（例如 Electron/Node）提供签名桥接能力；具体环境需求与说明见 [NOTICE.md](NOTICE.md)。
 
 ## 资源封包（XOR，开源版“提高提取成本”）
 
 本仓库提供一个简单的“资源封包”能力：将 zip 环境中的资源文件（例如 `assets/*` 与 `project.json`）改为按文件 XOR 封装并重命名，运行时再解包加载，以防止“0 技术人员”直接从产物里拖出素材/项目文件。
 
 - 开关：在 UI 的“保护 / 混淆”中勾选 `资源封包（XOR）`（对应 `options.wb.packResourcesXor`）
-- 生效范围：HTML（zip 项目）与所有 zip 类导出目标（Electron/NW.js/WebView/zip 等）
+- 生效范围：HTML 与 Electron 导出目标
 - 产物变化：新增 `wb-res/*.wb`，并移除/隐藏原始 `assets/*` 与 `project.json`
 - 安全边界：这是混淆封装，不提供机密性；密钥会随产物携带（只是分片/打乱/拼接），对本地对手不可保密
+
+## 混淆依赖说明
+
+本仓库会使用 `javascript-obfuscator` 对部分 JavaScript 产物做混淆处理：
+
+- 项目主页：https://github.com/javascript-obfuscator/javascript-obfuscator
+- 许可证声明与合规信息见 [NOTICE.md](wb-packager/NOTICE.md)
 
 ### 资源完整性验签（建议做法）
 
@@ -40,7 +63,7 @@ Converts Scratch projects into HTML files, zip archives, or executable programs 
 两种接入方式（可任选其一）：
 
 - 插件方式：实现 `hooks.signIntegrityManifest`，返回 `{kid, publicKeys, signature}`（signature 为二进制）
-- 脚本方式：使用 [sign-integrity.js](file:///g:/工程/javascript/desktop/wb-packager/src/build/sign-integrity.js) 对导出的 Electron zip 进行二次签名写回（通过环境变量提供私钥）
+- 脚本方式：使用 [sign-integrity.js](wb-packager/src/build/sign-integrity.js) 对导出的 Electron zip 进行二次签名写回（通过环境变量提供私钥）
 
 ## 修改文件列表（相对上游 TurboWarp Packager）
 
@@ -122,7 +145,7 @@ We ask that you at least take a moment to rename the website by editting `src/pa
 
 ### Large files
 
-Large files such as NW.js, Electron, and WKWebView executables are stored on an external server outside of this repository. While we aren't actively removing old files (the server still serves files unused since November 2020), we can't promise they will exist forever. The packager uses a secure checksum to validate these downloads. Forks are free to use our servers, but it's easy to setup your own if you'd prefer (it's just a static file server; see `src/packager/large-assets.js` for more information).
+Large files such as Electron executables are stored on an external server outside of this repository. While we aren't actively removing old files (the server still serves files unused since November 2020), we can't promise they will exist forever. The packager uses a secure checksum to validate these downloads. Downstream variants are free to use our servers, but it's easy to setup your own if you'd prefer (it's just a static file server; see `src/packager/large-assets.js` for more information).
 
 ### Service worker
 

@@ -1,6 +1,8 @@
 node_modules
 dist
 *.zip
+docs
+test
 
 # Related to Node.js API and related demo scripts
 demo_output*

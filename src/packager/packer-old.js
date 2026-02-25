@@ -369,7 +369,7 @@ const generateChromiumLicenseHTML = (licenses) => {
 // This should be in reverse-DNS format.
 // https://developer.apple.com/documentation/bundleresources/information_property_list/cfbundleidentifier
 const CFBundleIdentifier = 'CFBundleIdentifier';
-// Even if you fork the packager, you shouldn't change this string unless you want packaged macOS apps
+// Even for downstream variants, you shouldn't change this string unless you want packaged macOS apps
 // to lose all their data.
 const bundleIdentifierPrefix = 'org.turbowarp.packager.userland.';
 
@@ -856,13 +856,12 @@ cd "$(dirname "$0")"
     };
     zip.file(`${resourcesPrefix}package.json`, JSON.stringify(manifest, null, 4));
 
-    const wbProtectElectron = !!(this.options.wb && this.options.wb.protectElectron);
     const wbSplitElectronEntry = !!(this.options.wb && this.options.wb.splitElectronEntry);
-    const wbDisableDevtools = wbProtectElectron || !(this.options.wb && this.options.wb.disableDevtools === false);
-    const wbVerifyScriptHash = !(this.options.wb && this.options.wb.verifyScriptHash === false);
-    const wbVerifyIndexHash = !(this.options.wb && this.options.wb.verifyIndexHash === false);
+    const wbDisableDevtools = false;
+    const wbVerifyScriptHash = false;
+    const wbVerifyIndexHash = false;
     const indexHTML = projectZip.file('index.html') ? await projectZip.file('index.html').async('string') : '';
-    const expectedIndexHash = wbVerifyIndexHash ? sha256HexOfString(indexHTML) : null;
+    const expectedIndexHash = null;
 
     let mainJS = `'use strict';
 const {app, BrowserWindow, Menu, shell, screen, dialog, ipcMain} = require('electron');
@@ -893,8 +892,6 @@ const resourcesURL = Object.assign(new URL('file://'), {
   pathname: path.join(__dirname, '/')
 }).href;
 const defaultProjectURL = new URL('./index.html', resourcesURL).href;
-${wbVerifyScriptHash ? `const expectedScriptHash = ${JSON.stringify(this.wbAppIntegrity ? this.wbAppIntegrity.sha256 : sha256HexOfString(this.script))};` : ''}
-${wbVerifyIndexHash ? `const expectedIndexHash = ${JSON.stringify(expectedIndexHash)};` : ''}
 const wbIntegrityFile = ${JSON.stringify(this.wbAppIntegrity ? this.wbAppIntegrity.file : 'script.js')};
 
 const verifyIntegrity = () => {
@@ -1716,9 +1713,9 @@ cd "$(dirname "$0")"
     let storageProgressStart;
     let storageProgressEnd;
 
-    const encryptProject = !!(this.options.wb && this.options.wb.encryptProject && this.options.target !== 'html');
-    const shredWbResources = !!(encryptProject && this.options.wb && this.options.wb.shredWbResources);
-    const obfuscateUnpack = !!(this.options.wb && this.options.wb.obfuscateUnpack);
+    const encryptProject = false;
+    const shredWbResources = false;
+    const obfuscateUnpack = false;
     let wbUnpackHelpers = '';
     if (encryptProject) {
       const enc = this.wbEncryption;
@@ -2203,7 +2200,7 @@ cd "$(dirname "$0")"
     this.ensureNotAborted();
     await this.loadPlugins();
     await this.runPluginHook('beforePackage', null, {phase: 'beforePackage'});
-    const encryptProject = !!(this.options.wb && this.options.wb.encryptProject && this.options.target !== 'html');
+    const encryptProject = false;
     if (encryptProject) {
       if (!(crypto && crypto.subtle && crypto.subtle.importKey && crypto.subtle.encrypt)) {
         throw new Error('WebCrypto is not available');
@@ -2339,7 +2336,7 @@ cd "$(dirname "$0")"
         });
       }
     }
-    const useCleanTemplate = !!(this.options.wb && this.options.wb.cleanHtmlTemplate);
+    const useCleanTemplate = false;
     const html = useCleanTemplate ? encodeBigString`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2686,7 +2683,6 @@ cd "$(dirname "$0")"
   ${this.options.custom.js ? `<script>
     try { ${this.options.custom.js} } catch (e) { handleError(e); }
   </script>` : ''}
-  ${this.options.wb && this.options.wb.encryptProject ? `<script>window.__WB_ENC__ = ${JSON.stringify(this.wbEncryption ? Object.assign({}, this.wbEncryption, (this.options.wb && this.options.wb.shredWbResources) ? {shred: {parts: 32}} : null) : null)};</script>` : ''}
 </body>
 </html>
 ` : encodeBigString`<!DOCTYPE html>
@@ -3132,8 +3128,8 @@ cd "$(dirname "$0")"
     let outputHTML = html;
     let wbAppBin = null;
     let wbAppShards = null;
-    const encryptRuntime = !!(encryptProject && this.options.target.startsWith('electron-') && this.options.wb && this.options.wb.encryptRuntime);
-    const shredWbResources = !!(encryptProject && this.options.wb && this.options.wb.shredWbResources);
+    const encryptRuntime = false;
+    const shredWbResources = false;
     if (encryptRuntime) {
       const htmlText = new TextDecoder().decode(html);
       const inlineScripts = [];
@@ -3171,7 +3167,7 @@ cd "$(dirname "$0")"
 
       const bootstrapMeta = `window.__WB_APP__ = ${JSON.stringify({k: this.wbEncryption.k, iv: bytesToBase64(ivBytes), shred: (encryptRuntime && shredWbResources) ? {parts: 32} : null})};`;
       let bootstrap = `(async()=>{try{const app=document.getElementById('app');const loading=document.getElementById('loading');const errorScreen=document.getElementById('error');const errorMessage=document.getElementById('error-message');const errorStack=document.getElementById('error-stack');const handle=(e)=>{try{console.error(e);}catch(_){ }if(errorScreen){errorScreen.hidden=false;if(errorMessage)errorMessage.textContent=''+e;if(errorStack)errorStack.textContent=(e&&e.stack?e.stack:'no stack')+'\\nUser agent: '+navigator.userAgent;}else{alert(''+e);}};const meta=window.__WB_APP__;if(!meta||!meta.k||!meta.iv)throw new Error('Missing app metadata');const b64ToBytes=(b64)=>Uint8Array.from(atob(b64),c=>c.charCodeAt(0));const keyBytes=b64ToBytes(meta.k);const ivBytes=b64ToBytes(meta.iv);const key=await crypto.subtle.importKey('raw',keyBytes,{name:'AES-GCM'},false,['decrypt']);const load=(p)=>{if(window.EditorPreload&&typeof window.EditorPreload.readFile==='function'){return Promise.resolve(window.EditorPreload.readFile(p)).then(x=>x instanceof Uint8Array?x:new Uint8Array(x));}return new Promise((resolve,reject)=>{const xhr=new XMLHttpRequest();xhr.onload=()=>resolve(new Uint8Array(xhr.response));xhr.onerror=()=>reject(new Error('Failed to load app payload'));xhr.responseType='arraybuffer';xhr.open('GET',p);xhr.send();});};let data=null;const parts=meta&&meta.shred&&Number(meta.shred.parts);if(parts&&parts>1){const labelBytes=new TextEncoder().encode('wb-app');const combined=new Uint8Array(keyBytes.length+ivBytes.length+labelBytes.length);combined.set(keyBytes,0);combined.set(ivBytes,keyBytes.length);combined.set(labelBytes,keyBytes.length+ivBytes.length);let seed=0;if(crypto&&crypto.subtle&&crypto.subtle.digest){const digest=await crypto.subtle.digest('SHA-256',combined);seed=new DataView(digest).getUint32(0,false)>>>0;}const xorshift32=(x)=>{x^=x<<13;x^=x>>>17;x^=x<<5;return x>>>0;};const order=Array.from({length:parts},(_,i)=>i);let s=seed>>>0;for(let i=order.length-1;i>0;i--){s=xorshift32(s);const j=s%(i+1);const t=order[i];order[i]=order[j];order[j]=t;}const bufs=[];let total=0;for(let i=0;i<parts;i++){const physical=order[i];const b=await load('./wb-app.'+physical+'.wb');bufs.push(b);total+=b.length;}const out=new Uint8Array(total);let o=0;for(const b of bufs){out.set(b,o);o+=b.length;}data=out.buffer;}else{const b=await load('./wb-app.bin');data=b.buffer;}const plain=await crypto.subtle.decrypt({name:'AES-GCM',iv:ivBytes},key,data);const code=new TextDecoder('utf-8').decode(new Uint8Array(plain));const s=document.createElement('script');s.textContent=code;(document.head||document.documentElement).appendChild(s);}catch(e){handle(e);}})();`;
-      if (this.options.wb && this.options.wb.obfuscateUnpack) {
+      if (false) {
         bootstrap = JavaScriptObfuscator.obfuscate(bootstrap, {
           compact: true,
           controlFlowFlattening: true,
@@ -3392,19 +3388,10 @@ Packager.DEFAULT_OPTIONS = () => ({
   maxTextureDimension: 2048,
   wb: {
     obfuscateNames: false,
-    encryptProject: false,
-    encryptRuntime: false,
     opcodeObfuscation: false,
-    protectElectron: false,
     splitElectronEntry: false,
-    shredWbResources: false,
-    cleanHtmlTemplate: false,
     enablePluginDir: false,
     pluginDir: 'plugins',
-    obfuscateUnpack: true,
-    disableDevtools: true,
-    verifyScriptHash: true,
-    verifyIndexHash: true
   }
 });
 

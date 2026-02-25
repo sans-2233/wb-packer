@@ -48,7 +48,8 @@ const makeScaffolding = ({full}) => ({
       'text-encoding$': path.resolve(__dirname, 'src', 'scaffolding', 'text-encoding'),
       'htmlparser2$': path.resolve(__dirname, 'src', 'scaffolding', 'htmlparser2'),
       'scratch-translate-extension-languages$': path.resolve(__dirname, 'src', 'scaffolding', 'scratch-translate-extension-languages', 'languages.json'),
-      'scratch-parser$': path.resolve(__dirname, 'src', 'scaffolding', 'scratch-parser')
+      'scratch-parser$': path.resolve(__dirname, 'src', 'scaffolding', 'scratch-parser'),
+      'scratch-vm$': path.resolve(__dirname, '..', 'vendor', 'scratch-vm', 'src', 'index.js')
     }
   },
   module: {
@@ -58,13 +59,13 @@ const makeScaffolding = ({full}) => ({
         loader: 'babel-loader',
         include: [
           path.resolve(__dirname, 'src'),
-          path.resolve(__dirname, '..', 'scratch-vm', 'src'),
+          path.resolve(__dirname, '..', 'vendor', 'scratch-vm', 'src'),
           /node_modules[\\/]javascript-obfuscator[\\/]dist/,
           /node_modules[\\/]scratch-[^\\/]+[\\/]src/
         ],
         options: {
           babelrc: false,
-          presets: ['@babel/preset-env']
+          presets: [['@babel/preset-env', {targets: {ie: '11'}}]]
         }
       },
       {
@@ -142,7 +143,8 @@ const makeWebsite = () => ({
   },
   resolve: {
     alias: {
-      svelte: path.resolve('node_modules', 'svelte')
+      svelte: path.resolve('node_modules', 'svelte'),
+      'scratch-vm$': path.resolve(__dirname, '..', 'vendor', 'scratch-vm', 'src', 'index.js')
     },
     extensions: ['.mjs', '.js', '.svelte'],
     mainFields: ['svelte', 'browser', 'module', 'main']
@@ -160,17 +162,32 @@ const makeWebsite = () => ({
         loader: 'babel-loader',
         include: [
           path.resolve(__dirname, 'src'),
+          path.resolve(__dirname, '..', 'vendor', 'scratch-vm', 'src'),
           /node_modules[\\/]javascript-obfuscator[\\/]dist/
         ],
         options: {
           babelrc: false,
-          presets: ['@babel/preset-env']
+          presets: [['@babel/preset-env', {targets: {ie: '11'}}]]
         }
       },
       {
         test: /\.png|\.svg$/i,
         use: isStandalone ? {
           loader: 'url-loader'
+        } : {
+          loader: 'file-loader',
+          options: {
+            name: 'assets/[name].[contenthash].[ext]'
+          }
+        }
+      },
+      {
+        test: /\.mp3$/i,
+        use: isStandalone ? {
+          loader: 'url-loader',
+          options: {
+            esModule: false
+          }
         } : {
           loader: 'file-loader',
           options: {
@@ -207,14 +224,16 @@ const makeWebsite = () => ({
     ...(isStandalone ? [new EagerDynamicImportPlugin()] : []),
     ...(process.env.BUNDLE_ANALYZER === 'p4' ? [new BundleAnalyzerPlugin()] : [])
   ],
-  devServer: {
-    contentBase: './dist/',
-    compress: true,
-    overlay: true,
-    inline: false,
-    host: '0.0.0.0',
-    port: 8947
-  },
+  ...(isStandalone ? {} : {
+    devServer: {
+      contentBase: './dist/',
+      compress: true,
+      overlay: true,
+      inline: false,
+      host: '0.0.0.0',
+      port: process.env.PORT ? Number(process.env.PORT) : 8947
+    }
+  })
 });
 
 const makeNode = () => ({
@@ -254,9 +273,64 @@ const makeNode = () => ({
   ],
 });
 
+const makeNodeCliRuntime = () => ({
+  ...base,
+  devtool: '',
+  target: 'node',
+  output: {
+    filename: 'scaffolding/[name].js',
+    path: dist,
+    libraryTarget: 'commonjs2'
+  },
+  node: {
+    __dirname: false,
+  },
+  entry: {
+    'node-cli-runtime': './src/node-cli/runtime-entry.js'
+  },
+  module: {
+    rules: [
+      {
+        test: /\.m?jsx?$/,
+        loader: 'babel-loader',
+        include: [
+          path.resolve(__dirname, 'src'),
+          path.resolve(__dirname, '..', 'vendor', 'scratch-vm', 'src'),
+        ],
+        options: {
+          babelrc: false,
+          presets: [['@babel/preset-env', {targets: {node: '12'}}]]
+        }
+      },
+      {
+        test: /\.(svg|png)$/i,
+        use: [{
+          loader: 'url-loader'
+        }]
+      },
+      {
+        test: /\.mp3$/i,
+        use: [{
+          loader: 'url-loader',
+          options: {
+            esModule: false
+          }
+        }]
+      }
+    ]
+  },
+  resolveLoader: {
+    modules: [path.resolve(__dirname, 'src', 'build', 'inline-worker-loader'), 'node_modules'],
+  },
+  plugins: [
+    ...(buildId ? [new AddBuildIDToOutputPlugin(buildId)] : []),
+  ]
+});
+
 module.exports = [
   makeScaffolding({full: true}),
   makeScaffolding({full: false}),
+  makeNodeCliRuntime(),
   ...(process.env.BUILD_MODE === 'node' ? [
     makeNode()
   ] : [

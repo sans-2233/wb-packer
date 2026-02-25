@@ -86,6 +86,17 @@ const stableObfuscatedName = (prefix, id) => `${prefix}${sha256HexOfString(id).s
 
 const bytesToHex = (bytes) => Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
 
+const WBIDE_PROJECT_GLOBAL = '__WBIDE_PROJECT_BASE64';
+
+const compileProjectToJSData = (buffer, globalName) => {
+  if (!buffer) {
+    throw new Error('Missing project buffer');
+  }
+  const name = globalName || WBIDE_PROJECT_GLOBAL;
+  const b64 = Buffer.from(buffer).toString('base64');
+  return `(function(){var g=typeof window==='object'&&window||typeof globalThis!=='undefined'&&globalThis||this;if(!g)return;g.${name}="${b64}";})();`;
+};
+
 const randomOpcodeAlias = () => `op${bytesToHex(randomBytes(8))}`;
 
 const obfuscateProjectOpcodes = (projectJSON) => {
@@ -156,9 +167,26 @@ const xorCrypt = (bytes, keyBytes, seed) => {
 const normalizePackedResourceKey = (zipPath) => {
   if (zipPath === 'project.json' || zipPath.endsWith('/project.json')) return 'project.json';
   if (zipPath.startsWith('assets/')) return zipPath.slice('assets/'.length);
+  if (zipPath.startsWith('extensions/')) return zipPath;
+  if (zipPath.startsWith('static_assets/')) return zipPath;
   const slash = zipPath.lastIndexOf('/');
   if (slash !== -1) return zipPath.slice(slash + 1);
   return zipPath;
+};
+
+const isPlainObject = (value) => {
+  if (!value || typeof value !== 'object') return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+};
+
+const safeMergePlain = (target, patch) => {
+  if (!isPlainObject(target) || !isPlainObject(patch)) return target;
+  for (const [k, v] of Object.entries(patch)) {
+    if (!k || k === '__proto__' || k === 'prototype' || k === 'constructor') continue;
+    target[k] = v;
+  }
+  return target;
 };
 
 const bytesToBase64 = (bytes) => {
@@ -258,7 +286,21 @@ const injectWbResMetaIntoHtml = (htmlBytes, meta, nonce) => {
     const text = new TextDecoder().decode(htmlBytes);
     if (text.includes('window.__WB_RSP__')) return htmlBytes;
     const nonceAttr = (typeof nonce === 'string' && nonce) ? ` nonce="${nonce}"` : '';
-    const injected = text.replace('</body>', `<script${nonceAttr}>window.__WB_RSP__=${JSON.stringify(meta)};</script></body>`);
+    const injected = text.replace('</body>', `<script${nonceAttr}>window.__WB_RSP__=${JSON.stringify(meta)};</script><script${nonceAttr}>window.__WB_RSP_FETCH__=true;(function(){try{const orig=window.fetch;if(typeof orig!=='function')return;window.fetch=function(input,init){try{const url=(typeof input==='string')?input:(input&&input.url)||'';const m=url.match(/^(?:[a-z]+:)?\\/\\/[^/]+(\\/.*)$/i);const pathname=(m&&m[1])?m[1]:url;const rel=String(pathname||'').replace(/^\\//,'');if(!rel)return orig(input,init);if(rel.startsWith('extensions/')||rel.startsWith('static_assets/')){const f=window.__WB_RSP_LOAD__;if(typeof f==='function'){return Promise.resolve(f('./'+rel)).then((ab)=>{if(!ab)return orig(input,init);return new Response(ab,{status:200});});}}}catch(e){}return orig(input,init);};}catch(e){}})();</script></body>`);
+    if (injected === text) return htmlBytes;
+    return new TextEncoder().encode(injected);
+  } catch (e) {
+    return htmlBytes;
+  }
+};
+
+const injectRuntimeBootstrapIntoHtml = (htmlBytes, bootstrap, nonce) => {
+  try {
+    const code = String(bootstrap || '').trim();
+    if (!code) return htmlBytes;
+    const text = new TextDecoder().decode(htmlBytes);
+    const nonceAttr = (typeof nonce === 'string' && nonce) ? ` nonce="${nonce}"` : '';
+    const injected = text.replace('</body>', `<script${nonceAttr}>${code}</script></body>`);
     if (injected === text) return htmlBytes;
     return new TextEncoder().encode(injected);
   } catch (e) {
@@ -442,7 +484,7 @@ const generateChromiumLicenseHTML = (licenses) => {
 // This should be in reverse-DNS format.
 // https://developer.apple.com/documentation/bundleresources/information_property_list/cfbundleidentifier
 const CFBundleIdentifier = 'CFBundleIdentifier';
-// Even if you fork the packager, you shouldn't change this string unless you want packaged macOS apps
+// Even for downstream variants, you shouldn't change this string unless you want packaged macOS apps
 // to lose all their data.
 const bundleIdentifierPrefix = 'org.turbowarp.packager.userland.';
 
@@ -514,6 +556,9 @@ class Packager extends EventTarget {
     this.aborted = false;
     this.used = false;
     this.plugins = [];
+    this._pluginContextReady = false;
+    this._pluginContextExtensions = null;
+    this._wbFeatureFlags = {};
   }
 
   async loadPlugins () {
@@ -538,9 +583,32 @@ class Packager extends EventTarget {
           try {
             nodeRequire = __non_webpack_require__;
           } catch (e) {}
+          if (typeof nodeRequire !== 'function') {
+            try {
+              nodeRequire = require;
+            } catch (e) {}
+          }
           if (typeof nodeRequire === 'function') {
+            const fs = nodeRequire('fs');
             const path = nodeRequire('path');
-            dirPath = path.resolve(process.cwd(), dirName);
+            const candidates = [];
+            const pushUnique = (p) => {
+              if (!p || candidates.includes(p)) return;
+              candidates.push(p);
+            };
+            pushUnique(path.resolve(process.cwd(), dirName));
+            if (!path.isAbsolute(dirName)) {
+              pushUnique(path.resolve(process.cwd(), '..', dirName));
+              pushUnique(path.resolve(process.cwd(), '..', '..', dirName));
+            }
+            const pick = candidates.find(p => {
+              try {
+                return fs.existsSync(p) && fs.statSync(p).isDirectory();
+              } catch (e) {
+                return false;
+              }
+            });
+            dirPath = pick || candidates[0];
           }
         }
       } catch (e) {}
@@ -552,13 +620,42 @@ class Packager extends EventTarget {
 
   async runPluginHook (hookName, value, extraContext) {
     if (!this.plugins || this.plugins.length === 0) return value;
-    const context = Object.assign({
+    const host = {
+      enableWbFeatures: (patch) => {
+        if (!this._wbFeatureFlags || typeof this._wbFeatureFlags !== 'object') this._wbFeatureFlags = {};
+        if (isPlainObject(patch)) safeMergePlain(this._wbFeatureFlags, patch);
+      },
+      setWbOptions: (patch) => {
+        if (!this.options || typeof this.options !== 'object') return;
+        if (!this.options.wb || typeof this.options.wb !== 'object') this.options.wb = {};
+        if (isPlainObject(patch)) safeMergePlain(this.options.wb, patch);
+      }
+    };
+    const baseContext = Object.assign({
       target: this.options && this.options.target,
       options: this.options,
+      project: this.project,
+      host,
       libs: {
         JavaScriptObfuscator
       }
     }, extraContext || null);
+
+    if (hookName !== 'transformHookContext' && !this._pluginContextReady) {
+      let ext = null;
+      try {
+        ext = await runHookChain(this.plugins, 'transformHookContext', {}, baseContext);
+      } catch (e) {
+        ext = null;
+      }
+      this._pluginContextExtensions = (ext && typeof ext === 'object') ? ext : null;
+      this._pluginContextReady = true;
+    }
+
+    const context = this._pluginContextExtensions
+      ? Object.assign({}, baseContext, this._pluginContextExtensions)
+      : baseContext;
+
     return runHookChain(this.plugins, hookName, value, context);
   }
 
@@ -918,11 +1015,7 @@ cd "$(dirname "$0")"
       version: this.options.app && this.options.app.version,
       logLines: [],
       wb: {
-        protectElectron: !!(this.options.wb && this.options.wb.protectElectron),
-        encryptProject: !!(this.options.wb && this.options.wb.encryptProject),
-        encryptRuntime: !!(this.options.wb && this.options.wb.encryptRuntime),
         opcodeObfuscation: !!(this.options.wb && this.options.wb.opcodeObfuscation),
-        shredWbResources: !!(this.options.wb && this.options.wb.shredWbResources),
         splitElectronEntry: !!(this.options.wb && this.options.wb.splitElectronEntry),
         secureCsp: !!(this.options.wb && this.options.wb.secureCsp),
         extensionLoadStrategy: (this.options.wb && this.options.wb.extensionLoadStrategy) || 'auto',
@@ -1014,11 +1107,12 @@ cd "$(dirname "$0")"
     };
     zip.file(`${resourcesPrefix}package.json`, JSON.stringify(manifest, null, 4));
 
-    const wbProtectElectron = !!(this.options.wb && this.options.wb.protectElectron);
+    const wbFlags = (this._wbFeatureFlags && typeof this._wbFeatureFlags === 'object') ? this._wbFeatureFlags : {};
+    const wbProtectElectron = !!((wbFlags && wbFlags.protectElectron) || (this.options.wb && this.options.wb.protectElectron));
     const wbSplitElectronEntry = !!(this.options.wb && this.options.wb.splitElectronEntry);
-    const wbDisableDevtools = wbProtectElectron || !(this.options.wb && this.options.wb.disableDevtools === false);
-    const wbVerifyScriptHash = !(this.options.wb && this.options.wb.verifyScriptHash === false);
-    const wbVerifyIndexHash = !(this.options.wb && this.options.wb.verifyIndexHash === false);
+    const wbDisableDevtools = !!((wbFlags && wbFlags.disableDevtools) || (this.options.wb && this.options.wb.disableDevtools));
+    const wbVerifyScriptHash = !!((wbFlags && wbFlags.verifyScriptHash) || (this.options.wb && this.options.wb.verifyScriptHash));
+    const wbVerifyIndexHash = !!((wbFlags && wbFlags.verifyIndexHash) || (this.options.wb && this.options.wb.verifyIndexHash));
     const wbIntegrity = (this.options.wb && this.options.wb.integrity && typeof this.options.wb.integrity === 'object')
       ? this.options.wb.integrity
       : null;
@@ -1173,7 +1267,7 @@ const createWindow = (windowOptions) => {
       sandbox: false,
       contextIsolation: true,
       nodeIntegration: false,
-      devTools: ${wbDisableDevtools ? 'false' : 'true'},
+      devTools: ${wbDisableDevtools || wbProtectElectron ? 'false' : 'true'},
       preload: path.resolve(__dirname, ${JSON.stringify(electronPreloadName)}),
       backgroundThrottling: ${this.options.app.backgroundThrottling},
     },
@@ -1212,7 +1306,7 @@ const createProjectWindow = (url) => {
     window.maximize();
   }
   window.loadURL(url);
-  if (!${JSON.stringify(wbDisableDevtools)}) {
+  if (!${JSON.stringify(wbDisableDevtools || wbProtectElectron)}) {
     try {
       window.webContents.openDevTools({mode: 'detach'});
     } catch (e) {
@@ -1356,7 +1450,7 @@ app.on('web-contents-created', (event, contents) => {
     if (!window || input.type !== "keyDown") return;
     if (input.key === 'F11' || (input.key === 'Enter' && input.alt)) {
       window.setFullScreen(!window.isFullScreen());
-    } else if (!${JSON.stringify(wbDisableDevtools)} && (input.key === 'F12' || (input.key && input.key.toLowerCase() === 'i' && input.control && input.shift))) {
+    } else if (!${JSON.stringify(wbDisableDevtools || wbProtectElectron)} && (input.key === 'F12' || (input.key && input.key.toLowerCase() === 'i' && input.control && input.shift))) {
       try {
         if (contents.isDevToolsOpened()) {
           contents.closeDevTools();
@@ -1423,6 +1517,7 @@ contextBridge.exposeInMainWorld('EditorPreload', {
   wbGetOverlayLogPath: () => ipcRenderer.invoke('wb-overlay-log-path'),
   wbOpenOverlayLog: () => ipcRenderer.invoke('wb-open-overlay-log'),
   readFile: (path) => ipcRenderer.invoke('wb-read-file', {path}),
+  readStaticAsset: (path) => ipcRenderer.invoke('wb-read-static-asset', {path}),
   getWindowBounds: () => ipcRenderer.invoke('wb-get-window-bounds'),
   openDevTools: () => ipcRenderer.invoke('wb-open-devtools')
 });
@@ -1670,6 +1765,25 @@ ipcMain.handle('wb-read-file', async (event, {path: relativePath}) => {
   }
   const data = fs.readFileSync(resolved);
   return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+});
+ipcMain.handle('wb-read-static-asset', async (event, {path: relativePath}) => {
+  const rel = typeof relativePath === 'string' ? relativePath : '';
+  const safe = rel.trim().replace(/^\.?[\\/]+/, '');
+  if (!safe) return null;
+  const root = path.join(__dirname, 'static_assets');
+  try {
+    const normalized = path.normalize(safe);
+    if (path.isAbsolute(normalized)) return null;
+    if (normalized.split(path.sep).includes('..')) return null;
+    const resolvedRoot = path.resolve(root);
+    const resolved = path.resolve(resolvedRoot, normalized);
+    if (resolved !== resolvedRoot && !resolved.startsWith(resolvedRoot + path.sep)) return null;
+    if (!fs.existsSync(resolved)) return null;
+    const data = fs.readFileSync(resolved);
+    return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+  } catch (e) {
+    return null;
+  }
 });
 ipcMain.handle('wb-get-window-bounds', async (event) => {
   const window = BrowserWindow.fromWebContents(event.sender);
@@ -1999,6 +2113,63 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
     return zip;
   }
 
+  async addNodeCli () {
+    const zip = new (await getJSZip())();
+    const packageName = this.options && this.options.app && this.options.app.packageName ? this.options.app.packageName : 'wb-node-app';
+    const safeName = String(packageName || 'wb-node-app').toLowerCase().replace(/[^a-z0-9\-_]+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+    let sb3Buffer = this.project && this.project.arrayBuffer;
+    if (!(sb3Buffer instanceof ArrayBuffer)) {
+      try {
+        const blob = this.project && this.project.blob;
+        if (blob && typeof blob.arrayBuffer === 'function') {
+          sb3Buffer = await blob.arrayBuffer();
+        }
+      } catch (e) {}
+    }
+    if (!(sb3Buffer instanceof ArrayBuffer)) {
+      throw new Error('Missing project data');
+    }
+    zip.file('project.sb3', sb3Buffer);
+    try {
+      if (this._wbStaticAssets && Array.isArray(this._wbStaticAssets)) {
+        for (const entry of this._wbStaticAssets) {
+          if (!entry || typeof entry.path !== 'string' || !entry.path) continue;
+          const data = entry.data;
+          if (!(data instanceof ArrayBuffer)) continue;
+          zip.file(`static_assets/${entry.path}`, new Uint8Array(data));
+        }
+      }
+    } catch (e) {}
+
+    try {
+      const runtime = await this.fetchLargeAsset('node-cli-runtime', 'text');
+      zip.file('node-cli-runtime.js', runtime);
+    } catch (e) {
+      throw e;
+    }
+
+    const pkg = {
+      name: safeName || 'wb-node-app',
+      version: '1.0.0',
+      private: true,
+      scripts: {
+        start: 'node start.js'
+      }
+    };
+    zip.file('package.json', JSON.stringify(pkg, null, 2));
+    const startJs = [
+      "const path = require('path');",
+      "process.env.WB_STATIC_ASSETS_ROOT = path.join(__dirname, 'static_assets');",
+      "process.argv[2] = path.join(__dirname, 'project.sb3');",
+      "require('./node-cli-runtime.js');"
+    ].join('\n');
+    zip.file('start.js', startJs);
+    zip.file('README.txt', [
+      '1) npm run start'
+    ].join('\n'));
+    return zip;
+  }
+
   makeWebSocketProvider () {
     // If using the default turbowarp.org server, we'll add a fallback for the turbowarp.xyz alias.
     // This helps work around web filters as turbowarp.org can be blocked for games and turbowarp.xyz uses
@@ -2045,6 +2216,8 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
     let storageProgressEnd;
 
     const encryptProject = !!(this.options.wb && this.options.wb.encryptProject && this.options.target !== 'html');
+    const compileProjectRuntimeJS = !!(this.options.wb && this.options.wb.compileProjectRuntimeJS && this.options.target !== 'html');
+    const compileProjectToJS = !!(!compileProjectRuntimeJS && this.options.wb && this.options.wb.compileProjectToJS && this.options.target !== 'html');
     const packResourcesXor = !!(this.options.wb && this.options.wb.packResourcesXor);
     const shredWbResources = !!(encryptProject && this.options.wb && this.options.wb.shredWbResources);
     const obfuscateUnpack = !!(this.options.wb && this.options.wb.obfuscateUnpack);
@@ -2249,24 +2422,43 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
         return Promise.resolve(out);
       }`;
     } else {
-      let src;
-      if (encryptProject) {
+      if (compileProjectToJS && !encryptProject && this.project && this.project.type === 'sb3' && this.options.target !== 'zip-one-asset') {
         isZip = true;
-        src = shredWbResources ? './wb-project.0.wb' : './wb-project.bin';
         storageProgressStart = PROGRESS_FETCHED_COMPRESSED;
         storageProgressEnd = PROGRESS_EXTRACTED_COMPRESSED;
-      } else if (this.project.type === 'blob' || this.options.target === 'zip-one-asset') {
-        isZip = this.project.type !== 'blob';
-        src = './project.zip';
-        storageProgressStart = PROGRESS_FETCHED_COMPRESSED;
-        storageProgressEnd = PROGRESS_EXTRACTED_COMPRESSED;
+        getProjectDataFunction = `() => {
+        const g = (typeof window === 'object' && window) || (typeof globalThis !== 'undefined' && globalThis) || null;
+        if (!g || !g.${WBIDE_PROJECT_GLOBAL}) {
+          throw new Error('Missing ${WBIDE_PROJECT_GLOBAL}');
+        }
+        const b64 = String(g.${WBIDE_PROJECT_GLOBAL} || '');
+        const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+        const out = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+        return Promise.resolve(out);
+      }`;
       } else {
-        src = './assets/project.json';
-        storageProgressStart = PROGRESS_FETCHED_PROJECT_JSON;
-        storageProgressEnd = PROGRESS_FETCHED_ASSETS;
-      }
+        let src;
+        if (encryptProject) {
+          isZip = true;
+          src = shredWbResources ? './wb-project.0.wb' : './wb-project.bin';
+          storageProgressStart = PROGRESS_FETCHED_COMPRESSED;
+          storageProgressEnd = PROGRESS_EXTRACTED_COMPRESSED;
+        } else if (this.project.type === 'blob' || this.options.target === 'zip-one-asset') {
+          isZip = this.project.type !== 'blob';
+          src = './project.zip';
+          storageProgressStart = PROGRESS_FETCHED_COMPRESSED;
+          storageProgressEnd = PROGRESS_EXTRACTED_COMPRESSED;
+        } else if (compileProjectRuntimeJS && this.project && this.project.type === 'sb3' && this.options.target !== 'zip-one-asset') {
+          src = './assets/project-meta.json';
+          storageProgressStart = PROGRESS_FETCHED_PROJECT_JSON;
+          storageProgressEnd = PROGRESS_FETCHED_ASSETS;
+        } else {
+          src = './assets/project.json';
+          storageProgressStart = PROGRESS_FETCHED_PROJECT_JSON;
+          storageProgressEnd = PROGRESS_FETCHED_ASSETS;
+        }
 
-      getProjectDataFunction = `() => new Promise((resolve, reject) => {
+        getProjectDataFunction = `() => new Promise((resolve, reject) => {
         const readAll = async (readFile) => {
           ${encryptProject ? `
           const enc = window.__WB_ENC__;
@@ -2433,6 +2625,7 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
         xhr.open('GET', ${JSON.stringify(src)});
         xhr.send();
       })`;
+      }
     }
 
     result.push(`
@@ -2639,8 +2832,18 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
         };
         return async () => {
           await ensureHelper();
-          const plain = await loadPacked('project.json');
-          if (!plain) throw new Error('Missing packed project.json');
+          const projectKeyCandidates = (window.WB_PRECOMPILED ? ['project-meta.json', 'assets/project-meta.json'] : ['project.json', 'assets/project.json']);
+          let plain = null;
+          for (const key of projectKeyCandidates) {
+            plain = await loadPacked(key);
+            if (plain) break;
+          }
+          if (!plain) {
+            return (${getProjectDataFunction})().then((ab) => {
+              const buf = ab instanceof Uint8Array ? ab.buffer.slice(ab.byteOffset, ab.byteOffset + ab.byteLength) : ab;
+              return buf;
+            });
+          }
           return plain.buffer.slice(plain.byteOffset, plain.byteOffset + plain.byteLength);
         };` : `
         storage.addWebStore(
@@ -2790,11 +2993,28 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
     this.ensureNotAborted();
     await this.loadResources();
     this.ensureNotAborted();
+
+    try {
+      const wb = (this.options && this.options.wb) ? this.options.wb : null;
+      globalThis.compileProjectRuntimeJS = !!(wb && wb.compileProjectRuntimeJS);
+      globalThis.compileProjectToJS = !!(wb && wb.compileProjectToJS);
+    } catch (e) {}
+
     await this.loadPlugins();
     await this.runPluginHook('beforePackage', null, {phase: 'beforePackage'});
     this._embeddedExtensionFiles = null;
+    try {
+      this._wbStaticAssets = (typeof window === 'object' && window && Array.isArray(window.__WB_PACKAGER_STATIC_ASSETS__)) ? window.__WB_PACKAGER_STATIC_ASSETS__ : null;
+    } catch (e) {
+      this._wbStaticAssets = null;
+    }
+    const normalizedTarget = String(this.options.target || '');
+    if (normalizedTarget !== 'html' && normalizedTarget !== 'node-cli' && !normalizedTarget.startsWith('electron-')) {
+      throw new Error(`Unsupported target: ${normalizedTarget}`);
+    }
     const packResourcesXor = !!(this.options.wb && this.options.wb.packResourcesXor);
-    const encryptProject = !!(this.options.wb && this.options.wb.encryptProject && this.options.target !== 'html');
+    const wbFlags = (this._wbFeatureFlags && typeof this._wbFeatureFlags === 'object') ? this._wbFeatureFlags : {};
+    const encryptProject = !!(((wbFlags && wbFlags.encryptProject) || (this.options.wb && this.options.wb.encryptProject)) && this.options.target !== 'html');
     if (encryptProject) {
       if (!(crypto && crypto.subtle && crypto.subtle.importKey && crypto.subtle.encrypt)) {
         throw new Error('WebCrypto is not available');
@@ -2934,16 +3154,17 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
         });
       }
     }
-    const useCleanTemplate = !!(this.options.wb && this.options.wb.cleanHtmlTemplate);
+    const useCleanTemplate = !!((wbFlags && wbFlags.cleanHtmlTemplate) || (this.options.wb && this.options.wb.cleanHtmlTemplate));
     const useSecureCsp = !!(this.options.wb && this.options.wb.secureCsp);
-    const isLocalTarget = String(this.options.target || '').startsWith('electron-') || String(this.options.target || '').startsWith('nwjs-') || String(this.options.target || '') === 'webview-mac';
+    const isLocalTarget = String(this.options.target || '').startsWith('electron-');
     const cspNonce = useSecureCsp ? bytesToBase64(randomBytes(16)).replace(/=+$/g, '') : '';
     this._wbCspNonce = cspNonce;
     const scriptNonceAttr = useSecureCsp ? ` nonce="${cspNonce}"` : '';
     const csp = useSecureCsp
       ? `default-src 'none'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'none'; img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'nonce-${cspNonce}'; script-src-attr 'none'; connect-src 'self' https: http: ws: wss:${isLocalTarget ? " file:" : ""}; worker-src 'self' blob:;`
       : "default-src * 'self' 'unsafe-inline' 'unsafe-eval' data: blob:";
-    let html = useCleanTemplate ? encodeBigString`<!DOCTYPE html>
+    const includeProjectJs = this.options.target !== 'html' && this.options.wb && this.options.wb.compileProjectToJS;
+    let html = useCleanTemplate ? encodeBigString([`<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -2986,7 +3207,8 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
     </div>
   </div>
 
-  ${this.options.target === 'html' ? `<script${scriptNonceAttr}>${this.script}</script>` : `<script src="script.js"${scriptNonceAttr}></script>`}
+  ${this.options.target === 'html' ? `<script${scriptNonceAttr}>${this.script}</script>` : (includeProjectJs ? `<script src="wb-project.js"${scriptNonceAttr}></script>
+  <script src="script.js"${scriptNonceAttr}></script>` : `<script src="script.js"${scriptNonceAttr}></script>`)}
   <script${scriptNonceAttr}>${removeUnnecessaryEmptyLines(`
     const appElement = document.getElementById('app');
     const launchScreen = document.getElementById('launch');
@@ -3017,6 +3239,10 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
     const WB_DEBUG = ${JSON.stringify(!!(this.options.wb && this.options.wb.debugLog))};
     const WB_VERBOSE = ${JSON.stringify(!!(this.options.wb && this.options.wb.debugLogVerbose))};
     const WB_SECURE_CSP = ${JSON.stringify(useSecureCsp)};
+    const WB_PRECOMPILED = ${JSON.stringify(!!(this.options.wb && this.options.wb.compileProjectRuntimeJS))};
+    const WB_ALLOW_CUSTOM_EXT_FROM_PROJECT = ${JSON.stringify(!!(this.options.wb && this.options.wb.allowCustomExtensionsFromProject))};
+    const WB_DISABLE_EXTENSION_SECURITY = ${JSON.stringify(!!(this.options.wb && this.options.wb.disableExtensionSecurity))};
+    const WB_UNSANDBOXED_EXT_URL_KEYWORDS = ${JSON.stringify((this.options.wb && this.options.wb.unsandboxedExtensionUrlKeywords) || [])};
     const wbLog = (level, message, data) => {
       if (!WB_DEBUG) return;
       const m = String(message || '');
@@ -3046,6 +3272,14 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
       const vm = scaffolding.vm;
       window.scaffolding = scaffolding;
       window.vm = vm;
+      window.Scratch = {
+        vm,
+        runtime: vm.runtime,
+        renderer: vm.runtime && vm.runtime.renderer ? vm.runtime.renderer : vm.renderer,
+        audioEngine: vm.runtime && vm.runtime.audioEngine ? vm.runtime.audioEngine : null,
+        bitmapAdapter: vm.runtime && vm.runtime.v2BitmapAdapter ? vm.runtime.v2BitmapAdapter : null,
+        videoProvider: vm.runtime && vm.runtime.ioDevices && vm.runtime.ioDevices.video ? vm.runtime.ioDevices.video.provider : null
+      };
 
       vm.setTurboMode(${this.options.turbo});
       if (vm.setInterpolation) vm.setInterpolation(${this.options.interpolation});
@@ -3085,6 +3319,15 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
           wbReadFailures.push({path, via: 'fetch', error: err});
           throw e;
         }
+      };
+      const loadScript = async (src) => {
+        await new Promise((resolve, reject) => {
+          const el = document.createElement('script');
+          el.src = src;
+          el.onload = () => resolve();
+          el.onerror = () => reject(new Error('Failed to load script: ' + src));
+          document.head.appendChild(el);
+        });
       };
 
       const tryRead = async (path) => {
@@ -3179,6 +3422,8 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
           if (s === 'assets/project.json') keys.push('project.json');
           if (s === 'project.json') keys.push('assets/project.json');
           if (s.startsWith('assets/')) keys.push(s.slice('assets/'.length));
+          if (s.startsWith('extensions/')) keys.push(s.slice('extensions/'.length));
+          if (s.startsWith('static_assets/')) keys.push(s.slice('static_assets/'.length));
           const slash = s.lastIndexOf('/');
           if (slash !== -1) keys.push(s.slice(slash + 1));
           const seen = new Set();
@@ -3212,8 +3457,16 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
           const plain = xor(data, keyBytes, seed);
           return plain.buffer.slice(plain.byteOffset, plain.byteOffset + plain.byteLength);
         };
+        try { window.__WB_RSP_LOAD__ = loadPacked; } catch (e) {}
         return {
-          loadProject: () => loadPacked('./assets/project.json'),
+          loadProject: async () => {
+            const p = './assets/${compileProjectRuntimeJS ? 'project-meta.json' : 'project.json'}';
+            const ab = await tryRead(p) || await tryRead('./project.json');
+            if (ab) return ab;
+            const packed = await loadPacked(p) || await loadPacked('project.json');
+            if (packed) return packed;
+            throw new Error('Missing project.json');
+          },
           loadAsset: (assetId, dataFormat) => loadPacked('./assets/' + assetId + '.' + dataFormat)
         };
       })();
@@ -3430,8 +3683,15 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
           ].filter(i => i),
           (asset) => new URL('./assets/' + asset.assetId + '.' + asset.dataFormat, location).href
         );
-        const pj1 = await tryRead('./assets/project.json');
-        if (pj1) return pj1;
+        if (WB_PRECOMPILED) {
+          const meta1 = await tryRead('./assets/project-meta.json');
+          if (meta1) return meta1;
+          const meta2 = await tryRead('./project-meta.json');
+          if (meta2) return meta2;
+        } else {
+          const pj1 = await tryRead('./assets/project.json');
+          if (pj1) return pj1;
+        }
         const pj2 = await tryRead('./project.json');
         if (pj2) return pj2;
         const debugChecks = {
@@ -3442,7 +3702,9 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
           'wb-project.bin': !!(await tryRead('./wb-project.bin')),
           'assets/wb-project.bin': !!(await tryRead('./assets/wb-project.bin')),
           'assets/project.json': !!(await tryRead('./assets/project.json')),
+          'assets/project-meta.json': !!(await tryRead('./assets/project-meta.json')),
           'project.json': !!(await tryRead('./project.json')),
+          'project-meta.json': !!(await tryRead('./project-meta.json')),
         };
         const env = {
           href: location && location.href,
@@ -3457,8 +3719,124 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
       };
 
       window.__wbStart = async () => {
+        if (WB_PRECOMPILED) {
+          try {
+            await loadScript('./compiled-project.js');
+          } catch (e) {
+          }
+        }
         const projectData = await loadProjectData();
+        const parseProjectMeta = (data) => {
+          if (typeof data === 'string') return JSON.parse(data);
+          if (data && typeof data === 'object' && typeof data.byteLength === 'number') {
+            return JSON.parse(new TextDecoder().decode(new Uint8Array(data)));
+          }
+          return JSON.parse(String(data));
+        };
+        const getDeclaredExtensionIds = (projectMeta) => {
+          const set = new Set();
+          if (projectMeta && Array.isArray(projectMeta.extensions)) {
+            for (const id of projectMeta.extensions) {
+              if (typeof id === 'string' && id) set.add(id);
+            }
+          }
+          if (projectMeta && Array.isArray(projectMeta.targets)) {
+            for (const t of projectMeta.targets) {
+              if (!t || typeof t !== 'object') continue;
+              if (!Array.isArray(t.extensions)) continue;
+              for (const id of t.extensions) {
+                if (typeof id === 'string' && id) set.add(id);
+              }
+            }
+          }
+          return Array.from(set);
+        };
+        let declaredExtensionIds = [];
+        if (WB_PRECOMPILED) {
+          try {
+            declaredExtensionIds = getDeclaredExtensionIds(parseProjectMeta(projectData));
+          } catch (e) {
+            declaredExtensionIds = [];
+          }
+        }
+        if (WB_PRECOMPILED && scaffolding.vm && scaffolding.vm.extensionManager && Array.isArray(declaredExtensionIds) && declaredExtensionIds.length) {
+          for (const id of declaredExtensionIds) {
+            if (!scaffolding.vm.extensionManager.isExtensionLoaded(id) && scaffolding.vm.extensionManager.isBuiltinExtension(id)) {
+              scaffolding.vm.extensionManager.loadExtensionIdSync(id);
+            }
+          }
+        }
+        const applyExtensionPolicy = async () => {
+          const vm = scaffolding && scaffolding.vm;
+          const sm = (vm && vm.securityManager) || (vm && vm.extensionManager && vm.extensionManager.securityManager) || null;
+          const esm = (vm && vm.extensionManager && vm.extensionManager.securityManager) || null;
+          if (!sm) return;
+          const normalize = (value) => {
+            let url = String(value || '').trim();
+            if (url.length >= 2) {
+              const first = url.charCodeAt(0);
+              const last = url.charCodeAt(url.length - 1);
+              const isWrapped = (first === 96 && last === 96) ||
+                (first === 34 && last === 34) ||
+                (first === 39 && last === 39);
+              if (isWrapped) url = url.slice(1, -1).trim();
+            }
+            while (url && /[)\].,;>]+$/.test(url)) url = url.slice(0, -1);
+            return url;
+          };
+          sm.rewriteExtensionURL = normalize;
+          if (esm) esm.rewriteExtensionURL = normalize;
+          const setSandboxMode = (fn) => {
+            sm.getSandboxMode = fn;
+            if (esm) esm.getSandboxMode = fn;
+          };
+          if (WB_DISABLE_EXTENSION_SECURITY) {
+            const canLoad = () => true;
+            sm.canLoadExtensionFromProject = canLoad;
+            if (esm) esm.canLoadExtensionFromProject = canLoad;
+            setSandboxMode(() => 'unsandboxed');
+            return;
+          }
+          const policyBuffer = (typeof tryRead === 'function') ? (await tryRead('./assets/wb-extension-policy.json') || await tryRead('./wb-extension-policy.json')) : null;
+          let policy = null;
+          if (policyBuffer) {
+            try {
+              const text = new TextDecoder().decode(new Uint8Array(policyBuffer));
+              policy = JSON.parse(text);
+            } catch (e) {
+              policy = null;
+            }
+          }
+          const allowUrls = policy && Array.isArray(policy.urls) ? policy.urls.map(i => String(i)) : null;
+          const canLoad = (extensionURL) => {
+            if (!WB_ALLOW_CUSTOM_EXT_FROM_PROJECT) return false;
+            if (!allowUrls || allowUrls.length === 0) return true;
+            const u = normalize(extensionURL);
+            return allowUrls.includes(u);
+          };
+          sm.canLoadExtensionFromProject = canLoad;
+          if (esm) esm.canLoadExtensionFromProject = canLoad;
+          const keywords = (Array.isArray(WB_UNSANDBOXED_EXT_URL_KEYWORDS) ? WB_UNSANDBOXED_EXT_URL_KEYWORDS : [])
+            .map(i => String(i).toLowerCase())
+            .filter(i => i);
+          setSandboxMode((extensionURL) => {
+            const u = normalize(extensionURL).toLowerCase();
+            if (u.startsWith('data:') || u.startsWith('blob:')) return 'unsandboxed';
+            for (const k of keywords) {
+              if (u.includes(k)) return 'unsandboxed';
+            }
+            return 'worker';
+          });
+        };
+        await applyExtensionPolicy();
         await scaffolding.loadProject(projectData);
+        if (WB_PRECOMPILED && declaredExtensionIds.includes('pen') && scaffolding.vm && scaffolding.vm.extensionManager && !scaffolding.vm.extensionManager.isExtensionLoaded('pen')) {
+          throw new Error('Pen extension was declared but not loaded');
+        }
+        if (WB_PRECOMPILED && scaffolding.vm && typeof scaffolding.vm.attachCompiledProject === 'function') {
+          const compiled = (typeof globalThis !== 'undefined' && globalThis.__WBIDE_COMPILED_PROJECT__) ? globalThis.__WBIDE_COMPILED_PROJECT__ : (window && window.__WBIDE_COMPILED_PROJECT__);
+          scaffolding.vm.attachCompiledProject(compiled || null, parseProjectMeta(projectData));
+        }
         setProgress(1);
         loadingScreen.hidden = true;
         scaffolding.start();
@@ -3490,7 +3868,7 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
   ${this.options.wb && this.options.wb.encryptProject ? `<script${scriptNonceAttr}>window.__WB_ENC__ = ${JSON.stringify(this.wbEncryption ? Object.assign({}, this.wbEncryption, (this.options.wb && this.options.wb.shredWbResources) ? {shred: {parts: 32}} : null) : null)};</script>` : ''}
 </body>
 </html>
-` : encodeBigString`<!DOCTYPE html>
+`]) : encodeBigString([`<!DOCTYPE html>
 <!-- Created with ${WEBSITE} -->
 <html>
 <head>
@@ -3670,7 +4048,8 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
     </details>
   </div>
 
-  ${this.options.target === 'html' ? `<script${scriptNonceAttr}>${this.script}</script>` : `<script src="script.js"${scriptNonceAttr}></script>`}
+  ${this.options.target === 'html' ? `<script${scriptNonceAttr}>${this.script}</script>` : (includeProjectJs ? `<script src="wb-project.js"${scriptNonceAttr}></script>
+  <script src="script.js"${scriptNonceAttr}></script>` : `<script src="script.js"${scriptNonceAttr}></script>`)}
   <script${scriptNonceAttr}>${removeUnnecessaryEmptyLines(`
     const appElement = document.getElementById('app');
     const launchScreen = document.getElementById('launch');
@@ -3711,10 +4090,11 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
       window.vm = scaffolding.vm;
       window.Scratch = {
         vm,
-        renderer: vm.renderer,
-        audioEngine: vm.runtime.audioEngine,
-        bitmapAdapter: vm.runtime.v2BitmapAdapter,
-        videoProvider: vm.runtime.ioDevices.video.provider
+        runtime: vm.runtime,
+        renderer: vm.runtime && vm.runtime.renderer ? vm.runtime.renderer : vm.renderer,
+        audioEngine: vm.runtime && vm.runtime.audioEngine ? vm.runtime.audioEngine : null,
+        bitmapAdapter: vm.runtime && vm.runtime.v2BitmapAdapter ? vm.runtime.v2BitmapAdapter : null,
+        videoProvider: vm.runtime && vm.runtime.ioDevices && vm.runtime.ioDevices.video ? vm.runtime.ioDevices.video.provider : null
       };
 
       scaffolding.setUsername(${JSON.stringify(this.options.username)}.replace(/#/g, () => Math.floor(Math.random() * 10)));
@@ -3909,8 +4289,137 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
   ${await this.generateGetProjectData()}
   <script${scriptNonceAttr}>
     const run = async () => {
+      const WB_PRECOMPILED = ${JSON.stringify(!!(this.options.wb && this.options.wb.compileProjectRuntimeJS))};
+      const WB_ALLOW_CUSTOM_EXT_FROM_PROJECT = ${JSON.stringify(!!(this.options.wb && this.options.wb.allowCustomExtensionsFromProject))};
+      const WB_DISABLE_EXTENSION_SECURITY = ${JSON.stringify(!!(this.options.wb && this.options.wb.disableExtensionSecurity))};
+      const WB_UNSANDBOXED_EXT_URL_KEYWORDS = ${JSON.stringify((this.options.wb && this.options.wb.unsandboxedExtensionUrlKeywords) || [])};
+      const loadScript = async (src) => {
+        await new Promise((resolve, reject) => {
+          const el = document.createElement('script');
+          el.src = src;
+          el.onload = () => resolve();
+          el.onerror = () => reject(new Error('Failed to load script: ' + src));
+          document.head.appendChild(el);
+        });
+      };
+      if (WB_PRECOMPILED) {
+        try {
+          await loadScript('./compiled-project.js');
+        } catch (e) {
+        }
+      }
       const projectData = await getProjectData();
+      const parseProjectMeta = (data) => {
+        if (typeof data === 'string') return JSON.parse(data);
+        if (data && typeof data === 'object' && typeof data.byteLength === 'number') {
+          return JSON.parse(new TextDecoder().decode(new Uint8Array(data)));
+        }
+        return JSON.parse(String(data));
+      };
+      const getDeclaredExtensionIds = (projectMeta) => {
+        const set = new Set();
+        if (projectMeta && Array.isArray(projectMeta.extensions)) {
+          for (const id of projectMeta.extensions) {
+            if (typeof id === 'string' && id) set.add(id);
+          }
+        }
+        if (projectMeta && Array.isArray(projectMeta.targets)) {
+          for (const t of projectMeta.targets) {
+            if (!t || typeof t !== 'object') continue;
+            if (!Array.isArray(t.extensions)) continue;
+            for (const id of t.extensions) {
+              if (typeof id === 'string' && id) set.add(id);
+            }
+          }
+        }
+        return Array.from(set);
+      };
+      let declaredExtensionIds = [];
+      if (WB_PRECOMPILED) {
+        try {
+          declaredExtensionIds = getDeclaredExtensionIds(parseProjectMeta(projectData));
+        } catch (e) {
+          declaredExtensionIds = [];
+        }
+      }
+      if (WB_PRECOMPILED && scaffolding.vm && scaffolding.vm.extensionManager && Array.isArray(declaredExtensionIds) && declaredExtensionIds.length) {
+        for (const id of declaredExtensionIds) {
+          if (!scaffolding.vm.extensionManager.isExtensionLoaded(id) && scaffolding.vm.extensionManager.isBuiltinExtension(id)) {
+            scaffolding.vm.extensionManager.loadExtensionIdSync(id);
+          }
+        }
+      }
+      const applyExtensionPolicy = async () => {
+        const vm = scaffolding && scaffolding.vm;
+        const sm = (vm && vm.securityManager) || (vm && vm.extensionManager && vm.extensionManager.securityManager) || null;
+        const esm = (vm && vm.extensionManager && vm.extensionManager.securityManager) || null;
+        if (!sm) return;
+        const normalize = (value) => {
+          let url = String(value || '').trim();
+          if (url.length >= 2) {
+            const first = url.charCodeAt(0);
+            const last = url.charCodeAt(url.length - 1);
+            const isWrapped = (first === 96 && last === 96) ||
+              (first === 34 && last === 34) ||
+              (first === 39 && last === 39);
+            if (isWrapped) url = url.slice(1, -1).trim();
+          }
+          while (url && /[)\].,;>]+$/.test(url)) url = url.slice(0, -1);
+          return url;
+        };
+        sm.rewriteExtensionURL = normalize;
+        if (esm) esm.rewriteExtensionURL = normalize;
+        const setSandboxMode = (fn) => {
+          sm.getSandboxMode = fn;
+          if (esm) esm.getSandboxMode = fn;
+        };
+        if (WB_DISABLE_EXTENSION_SECURITY) {
+          const canLoad = () => true;
+          sm.canLoadExtensionFromProject = canLoad;
+          if (esm) esm.canLoadExtensionFromProject = canLoad;
+          setSandboxMode(() => 'unsandboxed');
+          return;
+        }
+        const policyBuffer = (typeof tryRead === 'function') ? (await tryRead('./assets/wb-extension-policy.json') || await tryRead('./wb-extension-policy.json')) : null;
+        let policy = null;
+        if (policyBuffer) {
+          try {
+            const text = new TextDecoder().decode(new Uint8Array(policyBuffer));
+            policy = JSON.parse(text);
+          } catch (e) {
+            policy = null;
+          }
+        }
+        const allowUrls = policy && Array.isArray(policy.urls) ? policy.urls.map(i => String(i)) : null;
+        const canLoad = (extensionURL) => {
+          if (!WB_ALLOW_CUSTOM_EXT_FROM_PROJECT) return false;
+          if (!allowUrls || allowUrls.length === 0) return true;
+          const u = normalize(extensionURL);
+          return allowUrls.includes(u);
+        };
+        sm.canLoadExtensionFromProject = canLoad;
+        if (esm) esm.canLoadExtensionFromProject = canLoad;
+        const keywords = (Array.isArray(WB_UNSANDBOXED_EXT_URL_KEYWORDS) ? WB_UNSANDBOXED_EXT_URL_KEYWORDS : [])
+          .map(i => String(i).toLowerCase())
+          .filter(i => i);
+        setSandboxMode((extensionURL) => {
+          const u = normalize(extensionURL).toLowerCase();
+          if (u.startsWith('data:') || u.startsWith('blob:')) return 'unsandboxed';
+          for (const k of keywords) {
+            if (u.includes(k)) return 'unsandboxed';
+          }
+          return 'worker';
+        });
+      };
+      await applyExtensionPolicy();
       await scaffolding.loadProject(projectData);
+      if (WB_PRECOMPILED && declaredExtensionIds.includes('pen') && scaffolding.vm && scaffolding.vm.extensionManager && !scaffolding.vm.extensionManager.isExtensionLoaded('pen')) {
+        throw new Error('Pen extension was declared but not loaded');
+      }
+      if (WB_PRECOMPILED && scaffolding.vm && typeof scaffolding.vm.attachCompiledProject === 'function') {
+        const compiled = (typeof globalThis !== 'undefined' && globalThis.__WBIDE_COMPILED_PROJECT__) ? globalThis.__WBIDE_COMPILED_PROJECT__ : (window && window.__WBIDE_COMPILED_PROJECT__);
+        scaffolding.vm.attachCompiledProject(compiled || null, parseProjectMeta(projectData));
+      }
       setProgress(1);
       loadingScreen.hidden = true;
       if (${this.options.autoplay}) {
@@ -3928,13 +4437,13 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
   </script>
 </body>
 </html>
-`;
+`]);
     this.wbAppIntegrity = null;
     let outputHTML = html;
     let wbAppBin = null;
     let wbAppShards = null;
-    const encryptRuntime = !!(encryptProject && this.options.target.startsWith('electron-') && this.options.wb && this.options.wb.encryptRuntime);
-    const shredWbResources = !!(encryptProject && this.options.wb && this.options.wb.shredWbResources);
+    const encryptRuntime = !!(encryptProject && this.options.target.startsWith('electron-') && ((wbFlags && wbFlags.encryptRuntime) || (this.options.wb && this.options.wb.encryptRuntime)));
+    const shredWbResources = !!(encryptProject && ((wbFlags && wbFlags.shredWbResources) || (this.options.wb && this.options.wb.shredWbResources)));
     if (encryptRuntime) {
       const htmlText = new TextDecoder().decode(html);
       const inlineScripts = [];
@@ -3972,7 +4481,7 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
 
       const bootstrapMeta = `window.__WB_APP__ = ${JSON.stringify({k: this.wbEncryption.k, iv: bytesToBase64(ivBytes), shred: (encryptRuntime && shredWbResources) ? {parts: 32} : null, n: (useSecureCsp && cspNonce) ? cspNonce : null})};`;
       let bootstrap = `(async()=>{try{const app=document.getElementById('app');const loading=document.getElementById('loading');const errorScreen=document.getElementById('error');const errorMessage=document.getElementById('error-message');const errorStack=document.getElementById('error-stack');const handle=(e)=>{try{console.error(e);}catch(_){ }if(errorScreen){errorScreen.hidden=false;if(errorMessage)errorMessage.textContent=''+e;if(errorStack)errorStack.textContent=(e&&e.stack?e.stack:'no stack')+'\\nUser agent: '+navigator.userAgent;}else{alert(''+e);}};const meta=window.__WB_APP__;if(!meta||!meta.k||!meta.iv)throw new Error('Missing app metadata');const b64ToBytes=(b64)=>Uint8Array.from(atob(b64),c=>c.charCodeAt(0));const keyBytes=b64ToBytes(meta.k);const ivBytes=b64ToBytes(meta.iv);const key=await crypto.subtle.importKey('raw',keyBytes,{name:'AES-GCM'},false,['decrypt']);const load=(p)=>{if(window.EditorPreload&&typeof window.EditorPreload.readFile==='function'){return Promise.resolve(window.EditorPreload.readFile(p)).then(x=>x instanceof Uint8Array?x:new Uint8Array(x));}return new Promise((resolve,reject)=>{const xhr=new XMLHttpRequest();xhr.onload=()=>resolve(new Uint8Array(xhr.response));xhr.onerror=()=>reject(new Error('Failed to load app payload'));xhr.responseType='arraybuffer';xhr.open('GET',p);xhr.send();});};let data=null;const parts=meta&&meta.shred&&Number(meta.shred.parts);if(parts&&parts>1){const labelBytes=new TextEncoder().encode('wb-app');const combined=new Uint8Array(keyBytes.length+ivBytes.length+labelBytes.length);combined.set(keyBytes,0);combined.set(ivBytes,keyBytes.length);combined.set(labelBytes,keyBytes.length+ivBytes.length);let seed=0;if(crypto&&crypto.subtle&&crypto.subtle.digest){const digest=await crypto.subtle.digest('SHA-256',combined);seed=new DataView(digest).getUint32(0,false)>>>0;}const xorshift32=(x)=>{x^=x<<13;x^=x>>>17;x^=x<<5;return x>>>0;};const order=Array.from({length:parts},(_,i)=>i);let s=seed>>>0;for(let i=order.length-1;i>0;i--){s=xorshift32(s);const j=s%(i+1);const t=order[i];order[i]=order[j];order[j]=t;}const bufs=[];let total=0;for(let i=0;i<parts;i++){const physical=order[i];const b=await load('./wb-app.'+physical+'.wb');bufs.push(b);total+=b.length;}const out=new Uint8Array(total);let o=0;for(const b of bufs){out.set(b,o);o+=b.length;}data=out.buffer;}else{const b=await load('./wb-app.bin');data=b.buffer;}const plain=await crypto.subtle.decrypt({name:'AES-GCM',iv:ivBytes},key,data);const code=new TextDecoder('utf-8').decode(new Uint8Array(plain));const s=document.createElement('script');try{if(meta&&meta.n)s.setAttribute('nonce',meta.n);}catch(_){ }s.textContent=code;(document.head||document.documentElement).appendChild(s);}catch(e){handle(e);}})();`;
-      if (this.options.wb && this.options.wb.obfuscateUnpack) {
+      if ((wbFlags && wbFlags.obfuscateUnpack) || (this.options.wb && this.options.wb.obfuscateUnpack)) {
         bootstrap = JavaScriptObfuscator.obfuscate(bootstrap, {
           compact: true,
           controlFlowFlattening: true,
@@ -3992,12 +4501,158 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
     this.ensureNotAborted();
 
     if (this.options.target !== 'html') {
+      const compileProjectRuntimeJS = !!(this.options.wb && this.options.wb.compileProjectRuntimeJS && this.options.target !== 'html');
+      const compileProjectToJS = !!(!compileProjectRuntimeJS && this.options.wb && this.options.wb.compileProjectToJS && this.options.target !== 'html');
       let zip;
       if (!encryptProject && this.project.type === 'sb3' && this.options.target !== 'zip-one-asset') {
         zip = await (await getJSZip()).loadAsync(this.project.arrayBuffer);
         for (const file of Object.keys(zip.files)) {
           zip.files[`assets/${file}`] = zip.files[file];
           delete zip.files[file];
+        }
+        if (compileProjectRuntimeJS) {
+          const {default: VM} = await import('scratch-vm');
+          const {default: Renderer} = await import('scratch-render');
+          const {default: ScratchStorage} = await import('@turbowarp/scratch-storage');
+          const {BitmapAdapter} = await import('@turbowarp/scratch-svg-renderer');
+          const vm = new VM();
+          let renderer = null;
+          try {
+            // IMPORTANT:
+            // Do NOT call vm.convertToPackagedRuntime() in the precompile VM.
+            // In our scratch-vm fork, packaged runtime mode modifies storage.createAsset() to avoid generating real
+            // asset IDs. That optimization breaks export because assets end up with short numeric IDs (e.g. 68.png)
+            // instead of md5ext filenames expected by the project metadata/runtime.
+            // For export/precompile we need stable md5-based asset IDs.
+            const stageWidth = 480;
+            const stageHeight = 360;
+            if (typeof document !== 'object' || !document || typeof document.createElement !== 'function') {
+              throw new Error('WebGL renderer is required to precompile this project, but the export environment has no DOM.');
+            }
+            const canvas = document.createElement('canvas');
+            canvas.width = stageWidth;
+            canvas.height = stageHeight;
+            try {
+              renderer = new Renderer(canvas, -stageWidth / 2, stageWidth / 2, -stageHeight / 2, stageHeight / 2);
+            } catch (e) {
+              throw new Error('WebGL renderer is required to precompile this project, but WebGL is unavailable in the export environment.');
+            }
+            // Sync the precompile VM environment with the real runtime environment as much as possible.
+            // This is needed for extensions that touch renderer internals (e.g., Simple3D) and projects
+            // that contain Scratch 2-style bitmap assets that must be upgraded by the v2BitmapAdapter.
+            vm.attachRenderer(renderer);
+            const storage = new ScratchStorage();
+            vm.attachStorage(storage);
+            vm.attachV2BitmapAdapter(new BitmapAdapter());
+            if (vm.securityManager) {
+              vm.securityManager.getSandboxMode = () => 'unsandboxed';
+              vm.securityManager.canLoadExtensionFromProject = () => true;
+            }
+            if (typeof vm.setStageSize === 'function') {
+              vm.setStageSize(stageWidth, stageHeight);
+            }
+
+            await vm.loadProject(this.project.arrayBuffer);
+
+            const exported = vm.runtime && typeof vm.runtime.precompileAndExport === 'function'
+              ? vm.runtime.precompileAndExport()
+              : null;
+            if (!exported || !exported.compiledProject) {
+              throw new Error('Failed to precompile project');
+            }
+
+            const jsonText = vm.toJSON();
+            const metaObj = JSON.parse(jsonText);
+            const runtimeTargets = vm.runtime && Array.isArray(vm.runtime.targets)
+              ? vm.runtime.targets.filter(t => t && t.isOriginal)
+              : [];
+            const stageTarget = vm.runtime && typeof vm.runtime.getTargetForStage === 'function'
+              ? vm.runtime.getTargetForStage()
+              : runtimeTargets.find(t => t && t.isStage);
+
+            const customExtensionEntries = (metaObj && metaObj.extensionURLs && typeof metaObj.extensionURLs === 'object')
+              ? Object.entries(metaObj.extensionURLs).filter(([id, url]) => typeof id === 'string' && id && typeof url === 'string' && url)
+              : [];
+            if (customExtensionEntries.length > 0 && !(this.options.wb && this.options.wb.allowCustomExtensionsFromProject) && !(this.options.wb && this.options.wb.disableExtensionSecurity)) {
+              if (this.options.wb && this.options.wb.stripCustomExtensionsFromProject) {
+                const removeIds = new Set(customExtensionEntries.map(([id]) => id));
+                if (metaObj && metaObj.extensionURLs && typeof metaObj.extensionURLs === 'object') {
+                  for (const id of Array.from(removeIds)) {
+                    delete metaObj.extensionURLs[id];
+                  }
+                }
+                if (metaObj && Array.isArray(metaObj.extensions)) {
+                  metaObj.extensions = metaObj.extensions.filter(id => !removeIds.has(id));
+                }
+                if (metaObj && Array.isArray(metaObj.targets)) {
+                  for (const t of metaObj.targets) {
+                    if (!t || typeof t !== 'object' || !Array.isArray(t.extensions)) continue;
+                    t.extensions = t.extensions.filter(id => !removeIds.has(id));
+                  }
+                }
+              } else {
+                const err = new Error('Custom extensions detected but not allowed');
+                err.name = 'WBCustomExtensionsError';
+                err.customExtensions = customExtensionEntries.map(([id, url]) => ({id, url}));
+                throw err;
+              }
+            }
+
+            if (metaObj && Array.isArray(metaObj.targets)) {
+              for (const t of metaObj.targets) {
+                if (!t || typeof t !== 'object') continue;
+                const rt = t.isStage
+                  ? stageTarget
+                  : runtimeTargets.find(i => i && !i.isStage && typeof i.getName === 'function' && i.getName() === t.name);
+                if (rt && typeof rt.id === 'string') {
+                  t.wbTargetId = rt.id;
+                }
+                t.blocks = {};
+                t.comments = {};
+              }
+            }
+            let projectMetaObj = metaObj;
+            let projectMetaText = JSON.stringify(projectMetaObj);
+            projectMetaText = await this.runPluginHook('transformProjectJson', projectMetaText, {phase: 'precompiledProjectMeta', fileName: 'assets/project-meta.json'});
+            projectMetaText = await this.runPluginHook('transformProjectMetaJson', projectMetaText, {phase: 'precompiledProjectMeta', fileName: 'assets/project-meta.json'});
+            try {
+              const parsed = JSON.parse(projectMetaText);
+              if (parsed && typeof parsed === 'object') {
+                projectMetaObj = parsed;
+                projectMetaText = JSON.stringify(projectMetaObj);
+              }
+            } catch (e) {}
+
+            let compiledJs = `(function(){var g=typeof window==='object'&&window||typeof globalThis!=='undefined'&&globalThis||this;if(!g)return;g.__WBIDE_COMPILED_PROJECT__=${JSON.stringify(exported.compiledProject)};})();`;
+            compiledJs = await this.runPluginHook('transformCompiledProject', compiledJs, {phase: 'precompiledRuntimeJS', fileName: 'compiled-project.js'});
+
+            zip.file('compiled-project.js', compiledJs);
+            zip.file('assets/project-meta.json', projectMetaText);
+            zip.file('assets/wb-extension-policy.json', JSON.stringify({v: 1, urls: projectMetaObj && projectMetaObj.extensionURLs && typeof projectMetaObj.extensionURLs === 'object' ? Object.values(projectMetaObj.extensionURLs) : [], byId: projectMetaObj && projectMetaObj.extensionURLs && typeof projectMetaObj.extensionURLs === 'object' ? projectMetaObj.extensionURLs : {}}));
+
+            for (const p of Object.keys(zip.files)) {
+              if (p === 'assets/project.json' || p.endsWith('/project.json')) {
+                delete zip.files[p];
+              }
+            }
+          } finally {
+            if (typeof vm.quit === 'function') {
+              vm.quit();
+            }
+            if (renderer && typeof renderer.dispose === 'function') {
+              renderer.dispose();
+            }
+          }
+        }
+        if (compileProjectToJS) {
+          let projectJs = compileProjectToJSData(this.project.arrayBuffer, WBIDE_PROJECT_GLOBAL);
+          projectJs = await this.runPluginHook('transformCompiledProject', projectJs, {phase: 'postCompileProject', fileName: 'wb-project.js'});
+          zip.file('wb-project.js', projectJs);
+          for (const p of Object.keys(zip.files)) {
+            if (p === 'assets/project.json' || p.endsWith('/project.json')) {
+              delete zip.files[p];
+            }
+          }
         }
       } else {
         zip = new (await getJSZip());
@@ -4045,6 +4700,17 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
         zip.file('script.js', this.script);
       }
 
+      try {
+        if (this._wbStaticAssets && Array.isArray(this._wbStaticAssets) && this.options.target.startsWith('electron-')) {
+          for (const entry of this._wbStaticAssets) {
+            if (!entry || typeof entry.path !== 'string' || !entry.path) continue;
+            const data = entry.data;
+            if (!(data instanceof ArrayBuffer)) continue;
+            zip.file(`static_assets/${entry.path}`, new Uint8Array(data));
+          }
+        }
+      } catch (e) {}
+
       if (packResourcesXor && !encryptProject) {
         try {
           const keyBytes = randomBytes(32);
@@ -4054,22 +4720,30 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
             const f = zip.files[p];
             if (!f || f.dir) return false;
             if (p === 'index.html') return false;
+            if (p === 'project.json' || p === 'project-meta.json') return false;
             if (p.startsWith('wb-res/')) return false;
+            if (p.endsWith('/wb-res/meta.json') || p === 'wb-res/meta.json') return false;
+            if (p === 'assets/project.json' || p === 'assets/project-meta.json') return false;
+            if (p === 'assets/wb-extension-policy.json' || p === 'wb-extension-policy.json') return false;
             if (p.startsWith('assets/')) return true;
-            if (p === 'project.json' || p.endsWith('/project.json')) return true;
+            if (p.startsWith('extensions/')) return true;
+            if (p.startsWith('static_assets/')) return true;
             return false;
           });
           for (const originalPath of paths) {
             const f = zip.file(originalPath);
             if (!f) continue;
             const key = normalizePackedResourceKey(originalPath);
-            const packedPath = `wb-res/${bytesToHex(randomBytes(8))}.wb`;
+            if (key === 'project.json') continue;
+            const packedPath = this.options.target && this.options.target.startsWith('electron-')
+              ? originalPath
+              : `wb-res/${bytesToHex(randomBytes(8))}.wb`;
             const plain = await f.async('uint8array');
             const seed = (fileSeed(key) ^ saltBytes[0]) & 0xff;
             const enc = xorCrypt(plain, keyBytes, seed);
             meta.map[key] = packedPath;
             zip.file(packedPath, enc);
-            zip.remove(originalPath);
+            if (packedPath !== originalPath) zip.remove(originalPath);
           }
           zip.file('wb-res/meta.json', JSON.stringify(meta));
           const indexFile = zip.file('index.html');
@@ -4082,28 +4756,53 @@ echo "Installed desktop entry: $HOME/.local/share/applications/${packageName}.de
         }
       }
 
-      if (this.options.target.startsWith('nwjs-')) {
-        zip = await this.addNwJS(zip);
-      } else if (this.options.target.startsWith('electron-')) {
+      try {
+        const bootstrap = await this.runPluginHook('getRuntimeBootstrap', '', {phase: 'getRuntimeBootstrap', fileName: 'index.html'});
+        if (bootstrap && typeof bootstrap === 'string' && bootstrap.trim()) {
+          const indexFile = zip.file('index.html');
+          if (indexFile) {
+            const htmlBytes = await indexFile.async('uint8array');
+            zip.file('index.html', injectRuntimeBootstrapIntoHtml(htmlBytes, bootstrap, this._wbCspNonce));
+          }
+        }
+      } catch (e) {}
+
+      if (this.options.target.startsWith('electron-')) {
         zip = await this.addElectron(zip);
-      } else if (this.options.target === 'webview-mac') {
-        zip = await this.addWebViewMac(zip);
+      } else if (this.options.target === 'node-cli') {
+        zip = await this.addNodeCli(zip);
+      } else {
+        throw new Error(`Unsupported target: ${this.options.target}`);
       }
 
+      zip = await this.runPluginHook('transformExportZip', zip, {phase: 'transformExportZip'});
+
       this.ensureNotAborted();
+      let zipData = await zip.generateAsync({
+        type: 'uint8array',
+        compression: 'DEFLATE',
+        // Use UNIX permissions so that executable bits are properly set for macOS and Linux
+        platform: 'UNIX'
+      }, (meta) => {
+        this.dispatchEvent(new CustomEvent('zip-progress', {
+          detail: {
+            progress: meta.percent / 100
+          }
+        }));
+      });
+
+      const codeSigning = this.options.wb && this.options.wb.codeSigning ? this.options.wb.codeSigning : null;
+      if (codeSigning && codeSigning.enabled && this.options.target.startsWith('electron-') && Adapter && typeof Adapter.signElectronExport === 'function') {
+        this.ensureNotAborted();
+        zipData = await Adapter.signElectronExport(zipData, {
+          target: this.options.target,
+          packageName: this.options.app && this.options.app.packageName ? this.options.app.packageName : '',
+          config: codeSigning
+        });
+      }
+
       return {
-        data: await zip.generateAsync({
-          type: 'uint8array',
-          compression: 'DEFLATE',
-          // Use UNIX permissions so that executable bits are properly set for macOS and Linux
-          platform: 'UNIX'
-        }, (meta) => {
-          this.dispatchEvent(new CustomEvent('zip-progress', {
-            detail: {
-              progress: meta.percent / 100
-            }
-          }));
-        }),
+        data: zipData,
         type: 'application/zip',
         filename: this.generateFilename('zip')
       };
@@ -4244,24 +4943,44 @@ Packager.DEFAULT_OPTIONS = () => ({
   maxTextureDimension: 2048,
   wb: {
     obfuscateNames: false,
-    encryptProject: false,
-    encryptRuntime: false,
     opcodeObfuscation: false,
-    protectElectron: false,
     splitElectronEntry: false,
-    shredWbResources: false,
-    cleanHtmlTemplate: false,
     extensionLoadStrategy: 'auto',
     debugLog: false,
     debugLogVerbose: false,
     enablePluginDir: false,
     pluginDir: 'plugins',
-    obfuscateUnpack: true,
-    disableDevtools: true,
-    verifyScriptHash: true,
-    verifyIndexHash: true,
     secureCsp: false,
     packResourcesXor: false,
+    compileProjectToJS: false,
+    compileProjectRuntimeJS: false,
+    allowCustomExtensionsFromProject: true,
+    stripCustomExtensionsFromProject: false,
+    unsandboxedExtensionUrlKeywords: [],
+    disableExtensionSecurity: false,
+    codeSigning: {
+      enabled: false,
+      windows: {
+        mode: 'pfx',
+        pfxPath: '',
+        certSubject: '',
+        timestampUrl: 'http://timestamp.digicert.com',
+        description: '',
+        signAllFiles: false
+      },
+      mac: {
+        identity: '',
+        hardenedRuntime: true,
+        timestamp: true,
+        deep: true,
+        notarize: false
+      },
+      linux: {
+        tool: 'gpg',
+        keyId: '',
+        armor: true
+      }
+    },
     integrity: {
       enabled: false,
       required: false,
